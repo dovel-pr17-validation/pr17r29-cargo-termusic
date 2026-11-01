@@ -372,9 +372,9 @@ dependencies = [
 
 [[package]]
 name = "async-ringbuf"
-version = "0.3.6"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57d99a9002e217633946c76364ee2058c9e62341fc56d24c6deb317ca272a1e5"
+checksum = "3173ca7670bc6ea9e2fafaff91036e6f9d45b9d5a886a03d41a0f9cbaaa17034"
 dependencies = [
  "futures-util",
  "ringbuf",
@@ -4416,9 +4416,9 @@ dependencies = [
 
 [[package]]
 name = "ringbuf"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d3ecbcab081b935fb9c618b07654924f27686b4aac8818e700580a83eedcb7f"
+checksum = "33d5f59e4145df5f29e84b6389394a8a3fedf7bd8c12570560ae67a917e6eae3"
 dependencies = [
  "crossbeam-utils",
  "portable-atomic",
