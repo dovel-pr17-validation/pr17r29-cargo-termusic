@@ -1,0 +1,208 @@
+use anyhow::Result;
+use termusiclib::player::playlist_helpers::PlaylistRemoveTrackType;
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
+use tonic::transport::Channel;
+
+use crate::{
+    clients::{PlayerControlConsumer, QueueControlConsumer, ServerControlConsumer},
+    ui::{
+        model::TxToMain,
+        msg::{Msg, ServerReqResponse},
+        tui_cmd::{PlaylistCmd, TuiCmd},
+    },
+};
+
+/// Actor that handles all requests to the Server via GRPC.
+///
+/// This actor can be given commands via [`TuiCmd`] and responds on [`TxToMain`].
+pub struct ServerRequestActor {
+    server_client: ServerControlConsumer,
+    player_client: PlayerControlConsumer,
+    queue_client: QueueControlConsumer,
+
+    rx_cmd: UnboundedReceiver<TuiCmd>,
+    tx_main: TxToMain,
+}
+
+impl ServerRequestActor {
+    /// Create and start a new [`ServerRequestActor`].
+    ///
+    /// To shutdown this actor, close `rx_cmd` channel.
+    pub fn start_actor(
+        raw_client: Channel,
+        rx_cmd: UnboundedReceiver<TuiCmd>,
+        tx_main: TxToMain,
+    ) -> JoinHandle<()> {
+        let server_client = ServerControlConsumer::new(raw_client.clone());
+        let player_client = PlayerControlConsumer::new(raw_client.clone());
+        let queue_client = QueueControlConsumer::new(raw_client);
+
+        let obj = Self {
+            server_client,
+            player_client,
+            queue_client,
+
+            rx_cmd,
+            tx_main,
+        };
+
+        tokio::spawn(Self::run(obj))
+    }
+
+    /// The actor loop.
+    async fn run(mut actor: Self) {
+        while let Some(cmd) = actor.rx_cmd.recv().await {
+            if let Err(err) = actor.handle_cmd(cmd).await {
+                error!("Error processing command to server: {err:#?}");
+            }
+        }
+    }
+
+    /// Handle all commands to the server and their responses.
+    async fn handle_cmd(&mut self, cmd: TuiCmd) -> Result<()> {
+        match cmd {
+            TuiCmd::TogglePause => {
+                // result will be populated back via UpdateStream
+                let _ = self.player_client.toggle_pause().await?;
+            }
+            TuiCmd::RestartTrack => {
+                // result will be populated back via UpdateStream
+                let () = self.player_client.restart_track().await?;
+            }
+            TuiCmd::SeekForward => {
+                // result will be populated back via UpdateStream
+                let () = self.player_client.seek_forward().await?;
+            }
+            TuiCmd::SeekBackward => {
+                // result will be populated back via UpdateStream
+                let () = self.player_client.seek_backward().await?;
+            }
+            TuiCmd::VolumeUp => {
+                // result will be populated back via UpdateStream
+                let _ = self.player_client.volume_up().await?;
+            }
+            TuiCmd::VolumeDown => {
+                // result will be populated back via UpdateStream
+                let _ = self.player_client.volume_down().await?;
+            }
+            TuiCmd::SpeedUp => {
+                // result will be populated back via UpdateStream
+                let _ = self.player_client.speed_up().await?;
+            }
+            TuiCmd::SpeedDown => {
+                // result will be populated back via UpdateStream
+                let _ = self.player_client.speed_down().await?;
+            }
+            TuiCmd::SkipNext => {
+                // result will be populated back via UpdateStream
+                self.player_client.skip_next().await?;
+            }
+            TuiCmd::SkipPrevious => {
+                // result will be populated back via UpdateStream
+                self.player_client.skip_previous().await?;
+            }
+            TuiCmd::ToggleGapless => {
+                // result will be populated back via UpdateStream
+                let _ = self.player_client.toggle_gapless().await?;
+            }
+            TuiCmd::CycleLoop => {
+                // result will be populated back via UpdateStream
+                let _ = self.queue_client.cycle_loop().await?;
+            }
+            TuiCmd::GetProgress => {
+                let res = self.player_client.get_progress().await?;
+
+                self.send_response(Msg::ServerReqResponse(ServerReqResponse::GetProgress(res)));
+            }
+            TuiCmd::ReloadConfig => {
+                self.server_client.reload_config().await?;
+            }
+            TuiCmd::Playlist(playlist_cmd) => self.handle_playlist_cmd(playlist_cmd).await?,
+            TuiCmd::CheckVersion => {
+                let res = self.server_client.info().await?;
+
+                // This check is a strict check, as termusic does not adhere to semantic versioning, at least as of 0.13.2+some commits.
+                if res.version != env!("TERMUSIC_VERSION") {
+                    // This is only a warning, as it compares the version strictly, meaning even a single commit difference makes it trigger
+                    // which can be annoying when developing only the TUI.
+                    warn!(
+                        "Mismatches Server and TUI version, this is potentially incompatible! TUI: \"{}\"; Server: \"{}\"",
+                        env!("TERMUSIC_VERSION"),
+                        res.version
+                    );
+                }
+            }
+            TuiCmd::QuitServer => {
+                let () = self.server_client.quit_server().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle Playlist requests.
+    async fn handle_playlist_cmd(&mut self, cmd: PlaylistCmd) -> Result<()> {
+        match cmd {
+            PlaylistCmd::PlaySpecific(playlist_play_specific) => {
+                // result will be populated back via UpdateStream
+                self.queue_client
+                    .play_specific(playlist_play_specific)
+                    .await?;
+            }
+            PlaylistCmd::AddTrack(playlist_add_track) => {
+                // result will be populated back via UpdateStream
+                self.queue_client
+                    .add_to_playlist(playlist_add_track)
+                    .await?;
+            }
+            PlaylistCmd::RemoveTrack(playlist_remove_track_indexed) => {
+                // result will be populated back via UpdateStream
+                self.queue_client
+                    .remove_from_playlist(PlaylistRemoveTrackType::Indexed(
+                        playlist_remove_track_indexed,
+                    ))
+                    .await?;
+            }
+            PlaylistCmd::Clear => {
+                // result will be populated back via UpdateStream
+                self.queue_client
+                    .remove_from_playlist(PlaylistRemoveTrackType::Clear)
+                    .await?;
+            }
+            PlaylistCmd::SwapTrack(playlist_swap_track) => {
+                // result will be populated back via UpdateStream
+                self.queue_client.swap_tracks(playlist_swap_track).await?;
+            }
+            PlaylistCmd::Shuffle => {
+                // result will be populated back via UpdateStream
+                self.queue_client.shuffle_playlist().await?;
+            }
+            PlaylistCmd::Sort {
+                criterion,
+                direction,
+            } => {
+                self.queue_client
+                    .sort_playlist(criterion, direction)
+                    .await?;
+            }
+            PlaylistCmd::RemoveDeletedItems => {
+                // result will be populated back via UpdateStream
+                self.queue_client.remove_deleted_tracks().await?;
+            }
+            PlaylistCmd::SelfReloadPlaylist => {
+                let tracks = self.queue_client.get_playlist().await?;
+
+                self.send_response(Msg::ServerReqResponse(ServerReqResponse::FullPlaylist(
+                    tracks,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn send_response(&self, msg: Msg) {
+        let _ = self.tx_main.send(msg);
+    }
+}

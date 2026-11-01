@@ -1,0 +1,546 @@
+use std::sync::LazyLock;
+
+use anyhow::{Result, anyhow};
+use regex::Regex;
+use termusiclib::common::const_unknown::{UNKNOWN_ARTIST, UNKNOWN_TITLE};
+use termusiclib::config::SharedTuiSettings;
+use termusiclib::player::RunningStatus;
+use termusiclib::podcast::episode::Episode;
+use termusiclib::track::{MediaTypesSimple, Track};
+use tui_realm_stdlib::components::Textarea;
+use tuirealm::command::{Cmd, Direction, Position};
+use tuirealm::component::{AppComponent, Component};
+use tuirealm::event::{Event, Key, KeyEvent, KeyModifiers};
+use tuirealm::props::{
+    AttrValue, Attribute, BorderType, Borders, HorizontalAlignment, LineStatic, Style, TextStatic,
+    Title,
+};
+use tuirealm::state::{State, StateValue};
+
+use super::TETrack;
+use crate::ui::ids::Id;
+use crate::ui::model::{ExtraLyricData, TrackType, UserEvent};
+use crate::ui::msg::{LyricMsg, Msg};
+use crate::ui::track_id::TUITrackId;
+use crate::ui::{Model, model::TermusicLayout};
+
+/// Regex for finding <br/> tags -- also captures any surrounding
+/// line breaks
+static RE_BR_TAGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"((\r\n)|\r|\n)*<br */?>((\r\n)|\r|\n)*").unwrap());
+
+/// Regex for finding HTML tags
+static RE_HTML_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^<>]*>").unwrap());
+
+/// Regex for finding more than two line breaks
+static RE_MULT_LINE_BREAKS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"((\r\n)|\r|\n){3,}").unwrap());
+
+fn format_lyric_title(artist: &str, title: &str) -> String {
+    format!("Lyrics of {artist:.20} - {title:.40}")
+}
+
+#[derive(Component)]
+pub struct Lyric {
+    component: Textarea,
+    config: SharedTuiSettings,
+}
+
+impl Lyric {
+    pub fn new(config: SharedTuiSettings) -> Self {
+        let component = {
+            let config = config.read();
+            Textarea::default()
+                .borders(
+                    Borders::default()
+                        .color(config.settings.theme.lyric_border())
+                        .modifiers(BorderType::Rounded),
+                )
+                .background(config.settings.theme.lyric_background())
+                .foreground(config.settings.theme.lyric_foreground())
+                .inactive(Style::new().bg(config.settings.theme.lyric_background()))
+                .title(Title::from(" Lyrics ").alignment(HorizontalAlignment::Left))
+                // .wrap(true)
+                .step(4)
+                .highlight_str(
+                    config
+                        .settings
+                        .theme
+                        .style
+                        .playlist
+                        .highlight_symbol
+                        .clone(),
+                )
+                .text_rows(TextStatic::from(format!("{}.", RunningStatus::Stopped)))
+        };
+
+        Self { component, config }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for Lyric {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        let config = self.config.clone();
+        let keys = &config.read().settings.keys;
+        let _cmd_result = match ev {
+            Event::Keyboard(KeyEvent {
+                code: Key::Down,
+                modifiers: KeyModifiers::NONE,
+            }) => self.perform(Cmd::Move(Direction::Down)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Up,
+                modifiers: KeyModifiers::NONE,
+            }) => self.perform(Cmd::Move(Direction::Up)),
+            Event::Keyboard(KeyEvent {
+                code: Key::PageDown,
+                modifiers: KeyModifiers::NONE,
+            }) => self.perform(Cmd::Scroll(Direction::Down)),
+            Event::Keyboard(KeyEvent {
+                code: Key::PageUp,
+                modifiers: KeyModifiers::NONE,
+            }) => self.perform(Cmd::Scroll(Direction::Up)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Home,
+                modifiers: KeyModifiers::NONE,
+            }) => self.perform(Cmd::GoTo(Position::Begin)),
+            Event::Keyboard(KeyEvent {
+                code: Key::End,
+                modifiers: KeyModifiers::NONE,
+            }) => self.perform(Cmd::GoTo(Position::End)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Tab,
+                modifiers: KeyModifiers::NONE,
+            }) => return Some(Msg::LyricMessage(LyricMsg::TextAreaBlurDown)),
+            Event::Keyboard(KeyEvent {
+                code: Key::BackTab,
+                modifiers: KeyModifiers::SHIFT,
+            }) => return Some(Msg::LyricMessage(LyricMsg::TextAreaBlurUp)),
+
+            Event::Keyboard(key) if key == keys.navigation_keys.down.get() => {
+                self.perform(Cmd::Move(Direction::Down))
+            }
+            Event::Keyboard(key) if key == keys.navigation_keys.up.get() => {
+                self.perform(Cmd::Move(Direction::Up))
+            }
+
+            Event::Keyboard(key) if key == keys.navigation_keys.goto_top.get() => {
+                self.perform(Cmd::GoTo(Position::Begin))
+            }
+            Event::Keyboard(key) if key == keys.navigation_keys.goto_bottom.get() => {
+                self.perform(Cmd::GoTo(Position::End))
+            }
+            _ => return None,
+        };
+        // "Textarea::perform" currently always returns "CmdResult::NoChange", so always redraw on event
+        // see https://github.com/veeso/tui-realm-stdlib/issues/27
+        Some(Msg::ForceRedraw)
+    }
+}
+
+impl Model {
+    /// Remount and reload the lyrics from the current track.
+    pub fn remount_lyric(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::Lyric,
+            Box::new(Lyric::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.lyric_update_title();
+        self.lyric_update();
+
+        Ok(())
+    }
+
+    /// Force reload lyrics from file. For example after a Tag Editor exit.
+    ///
+    /// If the current track type is [`Track`], then also unset the Lyric cache for the current track's path.
+    pub fn lyric_reload_from_file(&mut self) {
+        info!("Forcing reload of lyrics");
+        self.current_track_lyric.take();
+
+        if let Some(track) = self
+            .playback
+            .current_track()
+            .and_then(|v| v.as_track())
+            .and_then(|v| v.as_track())
+        {
+            Track::unset_cache_for_path(track.path());
+        }
+
+        self.remount_lyric()
+            .expect("Expected Lyric to remount correctly");
+    }
+
+    pub fn lyric_update_for_podcast_by_current_track(&mut self) {
+        let mut pod_title = String::new();
+        let mut ep_for_lyric = None;
+        if let Some(track) = self.playback.current_track()
+            && let TUITrackId::Podcast(url) = track.as_track_id().expect("Properly formatted id")
+        {
+            'outer: for pod in &self.podcast.podcasts {
+                for ep in &pod.episodes {
+                    if ep.url == url {
+                        pod_title.clone_from(&pod.title);
+                        ep_for_lyric = Some(ep.clone());
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if let Some(ep) = ep_for_lyric {
+            self.lyric_update_for_episode_after(&pod_title, &ep);
+        }
+
+        self.lyric_update_title();
+    }
+
+    pub fn lyric_update_for_podcast(&mut self) -> Result<()> {
+        if self.podcast.podcasts.is_empty() {
+            return Ok(());
+        }
+        if let Ok(State::Single(StateValue::Usize(episode_index))) = self.app.state(&Id::Episode) {
+            let podcast_selected = self
+                .podcast
+                .podcasts
+                .get(self.podcast.podcasts_index)
+                .ok_or_else(|| anyhow!("get podcast selected failed."))?
+                .clone();
+            let episode_selected = podcast_selected
+                .episodes
+                .get(episode_index)
+                .ok_or_else(|| anyhow!("get episode selected failed."))?;
+
+            self.lyric_update_for_episode_after(&podcast_selected.title, episode_selected);
+        }
+
+        self.lyric_update_title();
+        Ok(())
+    }
+
+    pub fn lyric_update_for_episode_after(&mut self, po_title: &str, ep: &Episode) {
+        // convert <br/> tags to a single line break
+        let br_to_lb = RE_BR_TAGS.replace_all(&ep.description, "\n");
+
+        // strip all HTML tags
+        let stripped_tags = RE_HTML_TAGS.replace_all(&br_to_lb, "");
+
+        // convert HTML entities (e.g., &amp;)
+        let decoded = match escaper::decode_html(&stripped_tags) {
+            Err(_) => stripped_tags.to_string(),
+            Ok(s) => s,
+        };
+
+        // remove anything more than two line breaks (i.e., one blank line)
+        let no_line_breaks = RE_MULT_LINE_BREAKS.replace_all(&decoded, "\n\n");
+
+        let (term_width, _) = viuer::terminal_size();
+        let term_width = usize::from(term_width);
+        let lyric_width = term_width * 3 / 5;
+
+        let mut final_text = TextStatic::from_iter([
+            LineStatic::styled(po_title.to_string(), Style::new().bold()),
+            LineStatic::styled(ep.title.clone(), Style::new().bold()),
+            LineStatic::from("   "),
+        ]);
+
+        if let Some(date) = ep.pubdate {
+            final_text.push_line(LineStatic::styled(
+                format!("Published: {}", date.format("%B %-d, %Y")),
+                Style::new().italic(),
+            ));
+        }
+
+        final_text.push_line(LineStatic::styled(
+            format!("Duration: {}", ep.format_duration()),
+            Style::new().italic(),
+        ));
+
+        final_text.push_line(LineStatic::from("   "));
+        final_text.push_line(LineStatic::styled("Description:", Style::new().bold()));
+
+        for line in no_line_breaks.split('\n') {
+            let unicode_width = unicode_width::UnicodeWidthStr::width(line);
+            if unicode_width > lyric_width {
+                let string_tmp = textwrap::wrap(line, lyric_width);
+                for line in string_tmp {
+                    final_text.push_line(LineStatic::from(line.to_string()));
+                }
+            } else {
+                final_text.push_line(LineStatic::from(line.to_string()));
+            }
+        }
+
+        let _ = self
+            .app
+            .attr(&Id::Lyric, Attribute::Text, AttrValue::Text(final_text));
+    }
+
+    /// Update lyrics. Needs to be run each time:
+    /// - a new playback position is available
+    /// - play state changed to / from "stopped"
+    /// - track change
+    ///
+    /// This function does not handle setting the lyric title. See [`lyric_update_title`](Model::lyric_update_title).
+    pub fn lyric_update(&mut self) {
+        const NO_LYRICS: &str = "No lyrics available.";
+
+        // this should be a different component
+        if self.layout == TermusicLayout::Podcast {
+            if let Err(e) = self.lyric_update_for_podcast() {
+                self.mount_error_popup(e.context("lyric update for podcast"));
+            }
+            return;
+        }
+        if self.playback.is_stopped() {
+            self.lyric_set_lyric("Stopped.");
+            return;
+        }
+        if let Some(track) = self.playback.current_track() {
+            // radio only needs to be updated on track change, which is handled in a different function
+            if MediaTypesSimple::LiveRadio == track.media_type() {
+                return;
+            }
+            let Some(track) = track.as_track() else {
+                return;
+            };
+
+            if self
+                .current_track_lyric
+                .as_ref()
+                .is_none_or(|extra| track.as_track().is_none_or(|v| extra.for_track != v.path()))
+            {
+                self.current_track_lyric.take();
+                if track.as_track().is_none() {
+                    self.lyric_set_lyric(NO_LYRICS);
+                    return;
+                }
+
+                let lyrics = match track.get_lyrics() {
+                    Err(err) => {
+                        // we want a escaped path here
+                        #[expect(clippy::unnecessary_debug_formatting)]
+                        {
+                            error!(
+                                "Failed fetching lyric data for {:#?}: {err}",
+                                track.as_track().unwrap().path()
+                            );
+                        }
+                        self.lyric_set_lyric(NO_LYRICS);
+                        return;
+                    }
+                    Ok(v) => v,
+                };
+
+                if lyrics.parsed_lyrics.is_some() {
+                    self.current_track_lyric = Some(ExtraLyricData {
+                        for_track: track.as_track().unwrap().path().to_owned(),
+                        data: (*lyrics).clone(),
+                        selected_idx: 0,
+                    });
+                } else {
+                    self.lyric_set_lyric(NO_LYRICS);
+                    return;
+                }
+            }
+
+            // by this point "current_track_lyric" is definitely "Some()"
+
+            let extra = self.current_track_lyric.as_ref().unwrap();
+
+            let Some(parsed_lyrics) = &extra.data.parsed_lyrics else {
+                self.lyric_set_lyric(NO_LYRICS);
+                return;
+            };
+
+            if parsed_lyrics.captions.is_empty() {
+                self.lyric_set_lyric(NO_LYRICS);
+                return;
+            }
+
+            let mut line = String::new();
+
+            if let Some(l) = parsed_lyrics.get_text(self.playback.current_track_pos()) {
+                line = l.to_string();
+            }
+
+            self.lyric_set_lyric(line);
+        }
+    }
+
+    /// Update the lyric field to show Radio information.
+    ///
+    /// Needs to be run on:
+    /// - track change from / to radio
+    pub fn lyric_update_for_radio<T: AsRef<str>>(&mut self, radio_title: T) {
+        if let Some(song) = self.playback.current_track()
+            && MediaTypesSimple::LiveRadio == song.media_type()
+        {
+            let radio_title = radio_title.as_ref();
+            if radio_title.is_empty() {
+                self.lyric_set_lyric("Radio");
+            } else {
+                self.lyric_set_lyric(format!("Currently Playing: {radio_title}"));
+            }
+        }
+    }
+
+    /// Set the given text as the current displayed lyric text.
+    fn lyric_set_lyric<T: Into<TextStatic>>(&mut self, text: T) {
+        self.app
+            .attr(&Id::Lyric, Attribute::Text, AttrValue::Text(text.into()))
+            .ok();
+    }
+
+    pub fn lyric_cycle(&mut self) {
+        if let Some(extra) = self.current_track_lyric.as_mut()
+            && let Some(f) = extra.cycle_lyric().ok().flatten()
+        {
+            let lang_ext = f.description.clone();
+            self.update_show_message_timeout(
+                "Lyric switch successful",
+                format!("{lang_ext} lyric is showing").as_str(),
+                None,
+            );
+        }
+    }
+    pub fn lyric_adjust_delay(&mut self, offset: i64) {
+        let time_pos = self.playback.current_track_pos();
+        // Note: this currently discards any offset requests if the track is not yet loaded, which should not happen due to preload
+        if let Some(track) = self.playback.current_track().and_then(TrackType::as_track) {
+            let Ok(mut te_track) = TETrack::try_from(track) else {
+                debug!("Could not adjust delay because it is not a music track!");
+                return;
+            };
+            if te_track
+                .lyric_set_with_extra(self.current_track_lyric.as_ref())
+                .is_none()
+            {
+                debug!(
+                    "Could not adjust delay because of mismatching extra data and current track!"
+                );
+                return;
+            }
+            te_track.lyric_adjust_delay(time_pos, offset);
+            if let Err(e) = te_track.save_tag() {
+                self.mount_error_popup(e.context("adjust lyric delay"));
+            }
+            self.current_track_lyric = Some(te_track.into_extra_lyric_data());
+        }
+    }
+
+    const LYRIC_PODCAST_TITLE: &str = " Details: ";
+
+    /// Update the Lyric Component's title.
+    ///
+    /// Needs to be run on:
+    /// - running status change
+    /// - track change
+    /// - switch from/to podcast layout
+    pub fn lyric_update_title(&mut self) {
+        let track = self.playback.current_track();
+
+        // this should be a different component
+        if self.layout == TermusicLayout::Podcast {
+            self.lyric_title_set(Self::LYRIC_PODCAST_TITLE.to_string());
+            return;
+        }
+
+        if self.playback.is_stopped() || track.is_none() {
+            self.lyric_title_set(" No track is playing ".to_string());
+            return;
+        }
+
+        let track = track.unwrap();
+
+        let lyric_title = match track.media_type() {
+            MediaTypesSimple::Music => {
+                let track = track.as_track();
+                let artist = track.map_or("Loading...", |track| {
+                    track.artist().unwrap_or(UNKNOWN_ARTIST)
+                });
+                // Updated from "Loading..." by calling the function again when data is ready.
+                let title =
+                    track.map_or("Loading...", |track| track.title().unwrap_or(UNKNOWN_TITLE));
+                format_lyric_title(artist, title)
+            }
+            MediaTypesSimple::LiveRadio => " Live Radio ".to_string(),
+            MediaTypesSimple::Podcast => Self::LYRIC_PODCAST_TITLE.to_string(),
+        };
+        self.lyric_title_set(lyric_title);
+    }
+
+    /// Set a Title for the Lyric Component.
+    fn lyric_title_set(&mut self, lyric_title: String) {
+        self.app
+            .attr(
+                &Id::Lyric,
+                Attribute::Title,
+                AttrValue::Title(Title::from(lyric_title).alignment(HorizontalAlignment::Center)),
+            )
+            .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_lyric_title;
+    use tui_realm_stdlib::components::Textarea;
+    use tuirealm::component::Component;
+    use tuirealm::props::{BorderType, Borders, HorizontalAlignment, Title};
+    use tuirealm::ratatui::Terminal;
+    use tuirealm::ratatui::backend::TestBackend;
+
+    fn render_lyric_title(artist: &str, title: &str, width: u16) -> String {
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let title = format_lyric_title(artist, title);
+        let mut textarea =
+            Textarea::default().borders(Borders::default().modifiers(BorderType::Rounded));
+        textarea = textarea.title(Title::from(title).alignment(HorizontalAlignment::Center));
+
+        terminal
+            .draw(|frame| textarea.view(frame, frame.area()))
+            .unwrap();
+
+        (0..width)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn lyric_title_does_not_pad_short_artist_and_track_names() {
+        assert_eq!(
+            format_lyric_title("Alan Walker", "Jump Start"),
+            "Lyrics of Alan Walker - Jump Start"
+        );
+    }
+
+    #[test]
+    fn lyric_title_caps_artist_at_twenty_and_track_title_at_forty_characters() {
+        assert_eq!(
+            format_lyric_title(
+                "An Artist With A Long Name",
+                "0123456789012345678901234567890123456789"
+            ),
+            "Lyrics of An Artist With A Lon - 0123456789012345678901234567890123456789"
+        );
+    }
+
+    #[test]
+    fn track_title_longer_than_forty_characters_is_truncated() {
+        let top_border = render_lyric_title("Alan Walker", &"x".repeat(41), 100);
+
+        assert!(top_border.contains(&format!("Lyrics of Alan Walker - {}", "x".repeat(40))));
+        assert!(!top_border.contains(&"x".repeat(41)));
+        assert_eq!(top_border.chars().count(), 100);
+    }
+
+    #[test]
+    fn lyric_title_is_clipped_by_a_narrow_panel() {
+        let top_border = render_lyric_title("Alan Walker", "Jump Start", 20);
+        assert!(top_border.contains("Jump Start"));
+        assert!(!top_border.contains("Lyrics of"));
+        assert_eq!(top_border.chars().count(), 20);
+    }
+}

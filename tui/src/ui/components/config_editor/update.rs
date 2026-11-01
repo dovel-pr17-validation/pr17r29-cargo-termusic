@@ -1,0 +1,665 @@
+use anyhow::Context;
+use termusiclib::config::new_shared_tui_settings;
+use termusiclib::config::v2::server::config_extra::ServerConfigVersionedDefaulted;
+use termusiclib::config::v2::tui::config_extra::TuiConfigVersionedDefaulted;
+use termusiclib::config::v2::tui::keys::KeyBinding;
+use termusiclib::config::v2::tui::theme::ThemeColors;
+use termusiclib::config::v2::tui::theme::styles::ColorTermusic;
+use termusiclib::utils::get_app_config_path;
+
+use crate::ui::Model;
+use crate::ui::components::CEHeader;
+use crate::ui::ids::{Id, IdCETheme, IdConfigEditor, IdKey, IdKeyGlobal, IdKeyOther};
+use crate::ui::msg::{
+    CONFIG_EDITOR_TABS_ORDER, ConfigEditorLayout, ConfigEditorMsg, GENERAL_FOCUS_ORDER,
+    KFGLOBAL_FOCUS_ORDER, KFMsg, KFOTHER_FOCUS_ORDER, Msg, THEME_COLOR_ITEM_FOCUS_ORDER_START,
+    THEME_FOCUS_ORDER,
+};
+use crate::ui::tui_cmd::TuiCmd;
+
+/// How many Themes there are without actual files and always exist
+pub const THEMES_WITHOUT_FILES: usize = 2;
+
+impl Model {
+    #[allow(clippy::too_many_lines)]
+    pub fn update_config_editor(&mut self, msg: ConfigEditorMsg) {
+        match msg {
+            ConfigEditorMsg::Open => {
+                self.config_editor.theme = self.config_tui.read().settings.theme.clone();
+                self.config_editor.key_config = self.config_tui.read().settings.keys.clone();
+                self.mount_config_editor();
+            }
+            ConfigEditorMsg::CloseCancel => {
+                self.config_editor.config_changed = false;
+                self.umount_config_editor();
+            }
+            ConfigEditorMsg::CloseOk => {
+                if self.config_editor.config_changed {
+                    self.config_editor.config_changed = false;
+                    self.mount_config_save_popup()
+                        .expect("Expected ConfigSavePopup to mount correctly");
+                } else {
+                    self.umount_config_editor();
+                }
+            }
+            ConfigEditorMsg::ConfigChanged => self.config_editor.config_changed = true,
+
+            ConfigEditorMsg::ConfigSaveOk => {
+                let _ = self.umount_config_save_popup();
+                match self.collect_config_data() {
+                    Ok(()) => {
+                        let res_server = ServerConfigVersionedDefaulted::save_config_path(
+                            &self.config_server.read().settings,
+                        )
+                        .context("config editor save server settings");
+                        let res_tui = TuiConfigVersionedDefaulted::save_config_path(
+                            &self.config_tui.read().settings,
+                        )
+                        .context("config editor save tui settings");
+
+                        let both_ok = res_server.is_ok() && res_tui.is_ok();
+
+                        if let Err(err) = res_server {
+                            self.mount_error_popup(err);
+                        }
+
+                        if let Err(err) = res_tui {
+                            self.mount_error_popup(err);
+                        }
+
+                        if both_ok {
+                            self.command(TuiCmd::ReloadConfig);
+
+                            self.refresh_static_theme_components();
+                            // only exit config editor if saving was successful
+                            self.umount_config_editor();
+                        }
+                    }
+                    Err(e) => {
+                        self.mount_error_popup(e.context("collect config data"));
+                        self.config_editor.config_changed = true;
+                    }
+                }
+            }
+            ConfigEditorMsg::ConfigSaveCancel => {
+                let _ = self.umount_config_save_popup();
+                self.umount_config_editor();
+            }
+
+            ConfigEditorMsg::ThemeSelectLoad(index) => {
+                self.preview_theme(index);
+            }
+            ConfigEditorMsg::ColorChanged(id, color_config) => {
+                self.config_editor.config_changed = true;
+                self.update_config_editor_color_changed(id, color_config);
+            }
+            ConfigEditorMsg::SymbolChanged(id, symbol) => {
+                self.config_editor.config_changed = true;
+
+                match id {
+                    IdConfigEditor::Theme(IdCETheme::LibraryHighlightSymbol) => {
+                        self.config_editor.theme.style.library.highlight_symbol = symbol;
+                    }
+                    IdConfigEditor::Theme(IdCETheme::PlaylistHighlightSymbol) => {
+                        self.config_editor.theme.style.playlist.highlight_symbol = symbol;
+                    }
+                    IdConfigEditor::Theme(IdCETheme::CurrentlyPlayingTrackSymbol) => {
+                        self.config_editor.theme.style.playlist.current_track_symbol = symbol;
+                    }
+                    _ => {}
+                }
+            }
+
+            ConfigEditorMsg::KeyChange(id, binding) => self.update_key(id, binding),
+
+            // Focus handling
+            ConfigEditorMsg::General(msg) => self.update_general(msg),
+            ConfigEditorMsg::Theme(msg) => self.update_theme(msg),
+            ConfigEditorMsg::ThemeColorItem(msg) => self.update_theme_color_item(msg),
+            ConfigEditorMsg::KeyFocusGlobal(msg) => self.update_key_focus_global(msg),
+            ConfigEditorMsg::KeyFocusOther(msg) => self.update_key_focus_other(msg),
+            ConfigEditorMsg::ChangeLayout(msg) => self.change_layout(msg),
+        }
+    }
+
+    /// Send a Mesasge to reload the theme on components that cannot simply be remounted without losing state.
+    #[inline]
+    fn refresh_static_theme_components(&mut self) {
+        let _ = self.tx_to_main.send(Msg::ReloadTheme);
+    }
+
+    /// Preview theme at Table index
+    fn preview_theme(&mut self, index: usize) {
+        // table entry 0 is termusic default
+        if index == 0 {
+            self.preview_theme_apply(ThemeColors::full_default(), 0);
+
+            return;
+        }
+        if index == 1 {
+            self.preview_theme_apply(ThemeColors::full_native(), 1);
+
+            return;
+        }
+
+        // idx - THEMES_WITHOUT_FILES as 0 until THEMES_WITHOUT_FILES table-entries are termusic themes without files, which always exists
+        if let Some(theme_filename) = self.config_editor.themes.get(index - THEMES_WITHOUT_FILES) {
+            match get_app_config_path() {
+                Ok(mut theme_path) => {
+                    theme_path.push("themes");
+                    theme_path.push(format!("{theme_filename}.yml"));
+                    match ThemeColors::from_yaml_file(&theme_path) {
+                        Ok(mut theme) => {
+                            theme.file_name = Some(theme_filename.clone());
+
+                            self.preview_theme_apply(theme, index);
+                        }
+                        Err(e) => {
+                            error!("Failed to load theme colors: {e:?}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error getting config path: {e:?}");
+                }
+            }
+        }
+    }
+
+    /// Apply the given theme as a preview
+    fn preview_theme_apply(&mut self, theme: ThemeColors, index: usize) {
+        self.config_editor.theme.theme = theme;
+        self.config_editor.config_changed = true;
+
+        // This is for preview the theme colors
+        let mut config = self.config_tui.read().clone();
+        config.settings.theme = self.config_editor.theme.clone();
+        let config = new_shared_tui_settings(config);
+        self.remount_config_color(&config, Some(index)).unwrap();
+    }
+
+    /// Change the Config Editor Layout to the next Tab.
+    pub fn change_layout(&mut self, msg: KFMsg) {
+        let focus = set_next_in_focus_array(self, msg, CONFIG_EDITOR_TABS_ORDER, |v| {
+            ConfigEditorLayout::try_from(v).ok()
+        });
+
+        let Some(id) = focus else {
+            return;
+        };
+
+        // one *should* the focused by now
+        let layout = ConfigEditorLayout::try_from(id)
+            .expect("Expected \"set_next_in_focus_array\" to only set known Layouts");
+        self.config_editor.last_layout = layout;
+
+        self.app
+            .remount(
+                Id::ConfigEditor(IdConfigEditor::Header),
+                Box::new(CEHeader::new(layout, &self.config_tui.read())),
+                Vec::new(),
+            )
+            .expect("To successfully remount");
+    }
+
+    /// Handle focus of the "General" tab
+    fn update_general(&mut self, msg: KFMsg) {
+        set_next_in_focus_array(self, msg, GENERAL_FOCUS_ORDER, |id| {
+            if let IdConfigEditor::General(id) = id {
+                Some(id)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Handle focus of the "Theme" tab
+    fn update_theme(&mut self, msg: KFMsg) {
+        set_next_in_focus_array(self, msg, THEME_FOCUS_ORDER, |id| {
+            if let IdConfigEditor::Theme(id) = id {
+                Some(id)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Handle focus inside the "Theme" tab's color-item pane
+    fn update_theme_color_item(&mut self, msg: KFMsg) {
+        set_next_in_focus_array(
+            self,
+            msg,
+            &THEME_FOCUS_ORDER[THEME_COLOR_ITEM_FOCUS_ORDER_START..],
+            |id| {
+                if let IdConfigEditor::Theme(id) = id {
+                    Some(id)
+                } else {
+                    None
+                }
+            },
+        );
+    }
+
+    /// Handle focus of the "Key Global" tab
+    fn update_key_focus_global(&mut self, msg: KFMsg) {
+        set_next_in_focus_array(self, msg, KFGLOBAL_FOCUS_ORDER, |id| {
+            if let IdConfigEditor::KeyGlobal(key) = id {
+                Some(IdKey::Global(key))
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Handle focus for the "Key Other" tab
+    fn update_key_focus_other(&mut self, msg: KFMsg) {
+        set_next_in_focus_array(self, msg, KFOTHER_FOCUS_ORDER, |id| {
+            if let IdConfigEditor::KeyOther(key) = id {
+                Some(IdKey::Other(key))
+            } else {
+                None
+            }
+        });
+    }
+
+    // cannot reduce a match statement
+    #[allow(clippy::too_many_lines)]
+    fn update_key(&mut self, id: IdKey, binding: KeyBinding) {
+        self.config_editor.config_changed = true;
+
+        // alias to reduce line length
+        let keys = &mut self.config_editor.key_config;
+
+        match id {
+            IdKey::Other(IdKeyOther::DatabaseAddAll) => keys.database_keys.add_all = binding,
+            IdKey::Other(IdKeyOther::DatabaseAddSelected) => {
+                keys.database_keys.add_selected = binding;
+            }
+            IdKey::Global(IdKeyGlobal::Config) => keys.select_view_keys.open_config = binding,
+            IdKey::Global(IdKeyGlobal::Down) => keys.navigation_keys.down = binding,
+            IdKey::Global(IdKeyGlobal::GotoBottom) => {
+                keys.navigation_keys.goto_bottom = binding;
+            }
+            IdKey::Global(IdKeyGlobal::GotoTop) => keys.navigation_keys.goto_top = binding,
+            IdKey::Global(IdKeyGlobal::Help) => keys.select_view_keys.open_help = binding,
+            IdKey::Global(IdKeyGlobal::LayoutTreeview) => {
+                keys.select_view_keys.view_library = binding;
+            }
+            IdKey::Global(IdKeyGlobal::LayoutDatabase) => {
+                keys.select_view_keys.view_database = binding;
+            }
+            IdKey::Global(IdKeyGlobal::Left) => keys.navigation_keys.left = binding,
+            IdKey::Global(IdKeyGlobal::LyricAdjustForward) => {
+                keys.lyric_keys.adjust_offset_forwards = binding;
+            }
+            IdKey::Global(IdKeyGlobal::LyricAdjustBackward) => {
+                keys.lyric_keys.adjust_offset_backwards = binding;
+            }
+            IdKey::Global(IdKeyGlobal::LyricCycle) => keys.lyric_keys.cycle_frames = binding,
+            IdKey::Global(IdKeyGlobal::PlayerToggleGapless) => {
+                keys.player_keys.toggle_prefetch = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerTogglePause) => {
+                keys.player_keys.toggle_pause = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerNext) => keys.player_keys.next_track = binding,
+            IdKey::Global(IdKeyGlobal::PlayerPrevious) => {
+                keys.player_keys.previous_track = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerRestartTrack) => {
+                keys.player_keys.restart_track = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerSeekForward) => {
+                keys.player_keys.seek_forward = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerSeekBackward) => {
+                keys.player_keys.seek_backward = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerSpeedUp) => keys.player_keys.speed_up = binding,
+            IdKey::Global(IdKeyGlobal::PlayerSpeedDown) => {
+                keys.player_keys.speed_down = binding;
+            }
+            IdKey::Global(IdKeyGlobal::Quit) => keys.quit = binding,
+            IdKey::Global(IdKeyGlobal::Right) => keys.navigation_keys.right = binding,
+            IdKey::Global(IdKeyGlobal::Up) => keys.navigation_keys.up = binding,
+            IdKey::Global(IdKeyGlobal::PlayerVolumeDown) => {
+                keys.player_keys.volume_down = binding;
+            }
+            IdKey::Global(IdKeyGlobal::PlayerVolumeUp) => {
+                keys.player_keys.volume_up = binding;
+            }
+            IdKey::Global(IdKeyGlobal::SavePlaylist) => {
+                keys.player_keys.save_playlist = binding;
+            }
+            IdKey::Other(IdKeyOther::LibraryDelete) => keys.library_keys.delete = binding,
+            IdKey::Other(IdKeyOther::LibraryLoadDir) => keys.library_keys.load_dir = binding,
+            IdKey::Other(IdKeyOther::LibraryPaste) => keys.library_keys.paste = binding,
+            IdKey::Other(IdKeyOther::LibrarySearch) => keys.library_keys.search = binding,
+            IdKey::Other(IdKeyOther::LibrarySearchYoutube) => {
+                keys.library_keys.youtube_search = binding;
+            }
+            IdKey::Other(IdKeyOther::LibraryTagEditor) => {
+                keys.library_keys.open_tag_editor = binding;
+            }
+            IdKey::Other(IdKeyOther::LibraryYank) => keys.library_keys.yank = binding,
+            IdKey::Other(IdKeyOther::PlaylistDelete) => keys.playlist_keys.delete = binding,
+            IdKey::Other(IdKeyOther::PlaylistDeleteAll) => keys.playlist_keys.delete_all = binding,
+            IdKey::Other(IdKeyOther::PlaylistShuffle) => keys.playlist_keys.shuffle = binding,
+            IdKey::Other(IdKeyOther::PlaylistModeCycle) => {
+                keys.playlist_keys.cycle_loop_mode = binding;
+            }
+            IdKey::Other(IdKeyOther::PlaylistPlaySelected) => {
+                keys.playlist_keys.play_selected = binding;
+            }
+            IdKey::Other(IdKeyOther::PlaylistSearch) => keys.playlist_keys.search = binding,
+            IdKey::Other(IdKeyOther::PlaylistSwapDown) => keys.playlist_keys.swap_down = binding,
+            IdKey::Other(IdKeyOther::PlaylistSwapUp) => keys.playlist_keys.swap_up = binding,
+            IdKey::Other(IdKeyOther::PlaylistAddRandomAlbum) => {
+                keys.playlist_keys.add_random_album = binding;
+            }
+            IdKey::Other(IdKeyOther::PlaylistAddRandomTracks) => {
+                keys.playlist_keys.add_random_songs = binding;
+            }
+            IdKey::Other(IdKeyOther::PlaylistSort) => {
+                keys.playlist_keys.sort = binding;
+            }
+            IdKey::Other(IdKeyOther::LibrarySwitchRoot) => keys.library_keys.cycle_root = binding,
+            IdKey::Other(IdKeyOther::LibraryAddRoot) => keys.library_keys.add_root = binding,
+            IdKey::Other(IdKeyOther::LibraryRemoveRoot) => keys.library_keys.remove_root = binding,
+            IdKey::Global(IdKeyGlobal::LayoutPodcast) => {
+                keys.select_view_keys.view_podcasts = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhMoveLeft) => {
+                keys.move_cover_art_keys.move_left = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhMoveRight) => {
+                keys.move_cover_art_keys.move_right = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhMoveUp) => {
+                keys.move_cover_art_keys.move_up = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhMoveDown) => {
+                keys.move_cover_art_keys.move_down = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhZoomIn) => {
+                keys.move_cover_art_keys.increase_size = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhZoomOut) => {
+                keys.move_cover_art_keys.decrease_size = binding;
+            }
+            IdKey::Global(IdKeyGlobal::XywhHide) => {
+                keys.move_cover_art_keys.toggle_hide = binding;
+            }
+            IdKey::Other(IdKeyOther::PodcastMarkPlayed) => keys.podcast_keys.mark_played = binding,
+            IdKey::Other(IdKeyOther::PodcastMarkAllPlayed) => {
+                keys.podcast_keys.mark_all_played = binding;
+            }
+            IdKey::Other(IdKeyOther::PodcastEpDownload) => {
+                keys.podcast_keys.download_episode = binding;
+            }
+            IdKey::Other(IdKeyOther::PodcastEpDeleteFile) => {
+                keys.podcast_keys.delete_local_episode = binding;
+            }
+            IdKey::Other(IdKeyOther::PodcastDeleteFeed) => keys.podcast_keys.delete_feed = binding,
+            IdKey::Other(IdKeyOther::PodcastDeleteAllFeeds) => {
+                keys.podcast_keys.delete_all_feeds = binding;
+            }
+            IdKey::Other(IdKeyOther::PodcastSearchAddFeed) => keys.podcast_keys.search = binding,
+            IdKey::Other(IdKeyOther::PodcastRefreshFeed) => {
+                keys.podcast_keys.refresh_feed = binding;
+            }
+            IdKey::Other(IdKeyOther::PodcastRefreshAllFeeds) => {
+                keys.podcast_keys.refresh_all_feeds = binding;
+            }
+        }
+    }
+
+    /// Apply the given color from the given component ID to their matching theme style preview for later saving.
+    ///
+    /// Note that actual live-preview of the style is already handled in the respetcive component itself, this is only saving that value to the config.
+    fn update_config_editor_color_changed(
+        &mut self,
+        id: IdConfigEditor,
+        color_config: ColorTermusic,
+    ) {
+        // alias to reduce line length
+        let style = &mut self.config_editor.theme.style;
+
+        let IdConfigEditor::Theme(id) = id else {
+            unimplemented!("Called color change update on non-theme component!");
+        };
+
+        // explicitly handle all cases
+        match id {
+            IdCETheme::LibraryForeground => {
+                style.library.foreground_color = color_config;
+            }
+            IdCETheme::LibraryBackground => {
+                style.library.background_color = color_config;
+            }
+            IdCETheme::LibraryBorder => {
+                style.library.border_color = color_config;
+            }
+            IdCETheme::LibraryHighlight => {
+                style.library.highlight_color = color_config;
+            }
+            IdCETheme::PlaylistForeground => {
+                style.playlist.foreground_color = color_config;
+            }
+            IdCETheme::PlaylistBackground => {
+                style.playlist.background_color = color_config;
+            }
+            IdCETheme::PlaylistBorder => {
+                style.playlist.border_color = color_config;
+            }
+            IdCETheme::PlaylistHighlight => {
+                style.playlist.highlight_color = color_config;
+            }
+            IdCETheme::ProgressForeground => {
+                style.progress.foreground_color = color_config;
+            }
+            IdCETheme::ProgressBackground => {
+                style.progress.background_color = color_config;
+            }
+            IdCETheme::ProgressBorder => {
+                style.progress.border_color = color_config;
+            }
+            IdCETheme::LyricForeground => {
+                style.lyric.foreground_color = color_config;
+            }
+            IdCETheme::LyricBackground => {
+                style.lyric.background_color = color_config;
+            }
+            IdCETheme::LyricBorder => {
+                style.lyric.border_color = color_config;
+            }
+            IdCETheme::ImportantPopupBackground => {
+                style.important_popup.background_color = color_config;
+            },
+            IdCETheme::ImportantPopupBorder => {
+                style.important_popup.border_color = color_config;
+            },
+            IdCETheme::ImportantPopupForeground => {
+                style.important_popup.foreground_color = color_config;
+            },
+            IdCETheme::FallbackBackground => {
+                style.fallback.background_color = color_config;
+            },
+            IdCETheme::FallbackBorder => {
+                style.fallback.border_color = color_config;
+            },
+            IdCETheme::FallbackForeground => {
+                style.fallback.foreground_color = color_config;
+            },
+            IdCETheme::FallbackHighlight => {
+                style.fallback.highlight_color = color_config;
+            },
+
+            // Everything below does not have anything to modify the theme style:
+
+            // Symbols dont have any style to live-apply
+            IdCETheme::LibraryHighlightSymbol | IdCETheme::PlaylistHighlightSymbol | IdCETheme::CurrentlyPlayingTrackSymbol |
+            // Labels(Titles) also dont have anything to live-apply
+            IdCETheme::LibraryLabel | IdCETheme::PlaylistLabel | IdCETheme::ImportantPopupLabel | IdCETheme::FallbackLabel | IdCETheme::LyricLabel | IdCETheme::ProgressLabel |
+            // Other
+            IdCETheme::ThemeSelectTable => {}
+        }
+    }
+}
+
+/// Fetch and set the next focus element, based on [`KFMsg`] and current focus.
+///
+/// If focus elem is somehow not available or in the array, defaults to `array[0]`.
+/// Does nothing if the array is empty.
+///
+/// Returns the newly focused element, if the array is not empty.
+fn set_next_in_focus_array<T, F>(
+    model: &mut Model,
+    msg: KFMsg,
+    array: &[T],
+    transform: F,
+) -> Option<IdConfigEditor>
+where
+    F: FnOnce(IdConfigEditor) -> Option<T>,
+    T: Copy + PartialEq + Into<IdConfigEditor>,
+{
+    // simple protection as the code below assumes at least 1 element in the array
+    if array.is_empty() {
+        return None;
+    }
+
+    let focus_elem = model.app.focus().and_then(|id| {
+        if let Id::ConfigEditor(v) = *id {
+            transform(v)
+        } else {
+            None
+        }
+    });
+
+    let focus = next_in_focus_array(msg, array, focus_elem)?;
+
+    let id = focus.into();
+    let _ = model.app.active(&Id::ConfigEditor(id));
+
+    Some(id)
+}
+
+/// Return the next focus target within `array`.
+///
+/// Callers may pass a subslice to keep focus cycling inside one pane. If focus
+/// is absent or outside that slice, the first item in the slice is selected.
+fn next_in_focus_array<T>(msg: KFMsg, array: &[T], focus_elem: Option<T>) -> Option<T>
+where
+    T: Copy + PartialEq,
+{
+    // simple protection as the code below assumes at least 1 element in the array
+    if array.is_empty() {
+        return None;
+    }
+
+    // fallback in case somehow the focus gets lost or is on a weird element, reset it to the first element
+    let Some(focus_elem) = focus_elem else {
+        return Some(array[0]);
+    };
+
+    let Some(position) = array.iter().position(|v| *v == focus_elem) else {
+        return Some(array[0]);
+    };
+
+    let position = match msg {
+        KFMsg::Next => (position + 1) % array.len(),
+        KFMsg::Previous => position.checked_sub(1).unwrap_or(array.len() - 1),
+    };
+
+    Some(array[position])
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::ui::ids::IdCETheme;
+    use crate::ui::msg::{KFMsg, THEME_COLOR_ITEM_FOCUS_ORDER_START, THEME_FOCUS_ORDER};
+
+    use super::next_in_focus_array;
+
+    fn theme_color_item_focus_order() -> &'static [IdCETheme] {
+        &THEME_FOCUS_ORDER[THEME_COLOR_ITEM_FOCUS_ORDER_START..]
+    }
+
+    #[test]
+    fn theme_color_items_next_wraps_to_first_item() {
+        assert_eq!(
+            next_in_focus_array(
+                KFMsg::Next,
+                theme_color_item_focus_order(),
+                Some(IdCETheme::FallbackHighlight)
+            ),
+            Some(IdCETheme::LibraryForeground)
+        );
+    }
+
+    #[test]
+    fn theme_color_items_previous_wraps_to_last_item() {
+        assert_eq!(
+            next_in_focus_array(
+                KFMsg::Previous,
+                theme_color_item_focus_order(),
+                Some(IdCETheme::LibraryForeground)
+            ),
+            Some(IdCETheme::FallbackHighlight)
+        );
+    }
+
+    #[test]
+    fn theme_full_order_still_crosses_table_boundary() {
+        assert_eq!(
+            next_in_focus_array(
+                KFMsg::Next,
+                THEME_FOCUS_ORDER,
+                Some(IdCETheme::ThemeSelectTable)
+            ),
+            Some(IdCETheme::LibraryForeground)
+        );
+        assert_eq!(
+            next_in_focus_array(
+                KFMsg::Previous,
+                THEME_FOCUS_ORDER,
+                Some(IdCETheme::LibraryForeground)
+            ),
+            Some(IdCETheme::ThemeSelectTable)
+        );
+    }
+
+    #[test]
+    fn theme_color_items_reset_to_first_item_when_focus_is_outside_slice() {
+        assert_eq!(
+            next_in_focus_array(
+                KFMsg::Previous,
+                theme_color_item_focus_order(),
+                Some(IdCETheme::ThemeSelectTable)
+            ),
+            Some(IdCETheme::LibraryForeground)
+        );
+    }
+
+    #[test]
+    fn theme_color_items_reset_to_first_item_when_focus_is_lost() {
+        assert_eq!(
+            next_in_focus_array(KFMsg::Next, theme_color_item_focus_order(), None),
+            Some(IdCETheme::LibraryForeground)
+        );
+    }
+
+    #[test]
+    fn empty_focus_order_returns_none() {
+        assert_eq!(
+            next_in_focus_array(
+                KFMsg::Next,
+                &[] as &[IdCETheme],
+                Some(IdCETheme::LibraryForeground)
+            ),
+            None
+        );
+    }
+}

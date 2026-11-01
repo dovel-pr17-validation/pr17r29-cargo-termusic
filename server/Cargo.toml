@@ -1,0 +1,70 @@
+[package]
+name = "termusic-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "server that can play music and running by itself. Works with termusic. "
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+
+[[bin]]
+name = "termusic-server"
+path = "src/server.rs"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+termusic-lib.workspace = true
+termusic-playback = { workspace = true, default-features = false }
+anyhow.workspace = true
+ctrlc.workspace = true
+log.workspace = true
+flexi_logger.workspace = true
+colored.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+clap.workspace = true
+
+
+# archive is named "termusic-v..." not "termusic-server-v..."
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/termusic-v{ version }-x86_64-linux.tar.xz"
+bin-dir = "termusic-v{ version }-x86_64-linux/{ bin }{ binary-ext }"
+pkg-fmt = "txz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/termusic-v{ version }-x86_64-linux.tar.xz"
+bin-dir = "termusic-v{ version }-x86_64-linux/{ bin }{ binary-ext }"
+pkg-fmt = "txz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/termusic-v{ version }-x86_64-macos.tar.xz"
+bin-dir = "termusic-v{ version }-x86_64-macos/{ bin }{ binary-ext }"
+pkg-fmt = "txz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/termusic-v{ version }-x86_64-windows.zip"
+bin-dir = "termusic-v{ version }-x86_64-windows/{ bin }{ binary-ext }"
+pkg-fmt = "zip"
+
+[features]
+# NOTE: this package fails to compile if not one of the backends (rusty, gst, mpv) are compiled in!
+default = []
+# left for debug
+# default = ["mpv"]
+# default = ["gst"]
+gst = ["termusic-playback/gst"]
+mpv = ["termusic-playback/mpv"]
+# rusty = ["termusic-playback/rusty"]
+rusty-soundtouch = ["termusic-playback/rusty-soundtouch"]
+rusty-libopus = ["termusic-playback/rusty-libopus"]
+all-backends = ["gst", "mpv", "rusty-soundtouch"]

@@ -1,0 +1,361 @@
+use anyhow::Result;
+use termusiclib::config::{SharedTuiSettings, TuiOverlay};
+use tui_realm_stdlib::{
+    components::{Input, Table},
+    prop_ext::CommonHighlight,
+};
+use tuirealm::{
+    command::{Cmd, CmdResult, Direction, Position},
+    component::{AppComponent, Component},
+    event::{Event, Key, KeyEvent, KeyModifiers},
+    props::{
+        AttrValue, Attribute, BorderType, Borders, HorizontalAlignment, InputType, LineStatic,
+        Style, TableBuilder, Title,
+    },
+    state::{State, StateValue},
+};
+
+use super::{YNConfirm, YNConfirmStyle};
+use crate::ui::ids::Id;
+use crate::ui::model::{Model, UserEvent};
+use crate::ui::msg::{Msg, PCMsg};
+use crate::ui::{components::popups::DeleteConfirmInputPopup, utils::STYLE_REMOVE_REVERSE};
+
+#[derive(Component)]
+pub struct PodcastAddPopup {
+    component: Input,
+}
+
+impl PodcastAddPopup {
+    pub fn new(config: &TuiOverlay) -> Self {
+        let config = &config.settings;
+        Self {
+            component: Input::default()
+                .foreground(config.theme.library_foreground())
+                .background(config.theme.library_background())
+                .borders(
+                    Borders::default()
+                        .color(config.theme.library_border())
+                        .modifiers(BorderType::Rounded),
+                )
+                // .invalid_style(Style::default().fg(Color::Red))
+                .input_type(InputType::Text)
+                .title(
+                    Title::from(" Add or search podcast feed : (Enter to confirm) ")
+                        .alignment(HorizontalAlignment::Left),
+                ),
+        }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for PodcastAddPopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        let cmd_result = match ev {
+            Event::Keyboard(KeyEvent {
+                code: Key::Left, ..
+            }) => self.perform(Cmd::Move(Direction::Left)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Right, ..
+            }) => self.perform(Cmd::Move(Direction::Right)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Home, ..
+            }) => self.perform(Cmd::GoTo(Position::Begin)),
+            Event::Keyboard(KeyEvent { code: Key::End, .. }) => {
+                self.perform(Cmd::GoTo(Position::End))
+            }
+            Event::Keyboard(KeyEvent {
+                code: Key::Delete, ..
+            }) => self.perform(Cmd::Cancel),
+            Event::Keyboard(KeyEvent {
+                code: Key::Backspace,
+                ..
+            }) => self.perform(Cmd::Delete),
+            Event::Keyboard(KeyEvent {
+                code: Key::Char(ch),
+                modifiers: KeyModifiers::SHIFT | KeyModifiers::NONE,
+            }) => self.perform(Cmd::Type(*ch)),
+            Event::Keyboard(KeyEvent { code: Key::Esc, .. }) => {
+                return Some(Msg::Podcast(PCMsg::PodcastAddPopupCloseCancel));
+            }
+            Event::Keyboard(KeyEvent {
+                code: Key::Enter, ..
+            }) => match self.component.state() {
+                State::Single(StateValue::String(input_string)) => {
+                    return Some(Msg::Podcast(PCMsg::PodcastAddPopupCloseOk(input_string)));
+                }
+                _ => CmdResult::NoChange,
+            },
+            _ => CmdResult::NoChange,
+        };
+        match cmd_result {
+            CmdResult::NoChange => None,
+            _ => Some(Msg::ForceRedraw),
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct FeedDeleteConfirmRadioPopup {
+    component: YNConfirm,
+}
+
+impl FeedDeleteConfirmRadioPopup {
+    pub fn new(config: SharedTuiSettings) -> Self {
+        let component =
+            YNConfirm::new_with_cb(config, " Are sure you to delete the feed? ", |config| {
+                YNConfirmStyle {
+                    foreground_color: config.settings.theme.library_foreground(),
+                    background_color: config.settings.theme.library_background(),
+                    border_color: config.settings.theme.library_border(),
+                    title_alignment: HorizontalAlignment::Left,
+                }
+            });
+
+        Self { component }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for FeedDeleteConfirmRadioPopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        self.component.on(
+            ev,
+            Msg::Podcast(PCMsg::FeedDeleteCloseOk),
+            Msg::Podcast(PCMsg::FeedDeleteCloseCancel),
+        )
+    }
+}
+
+#[derive(Component)]
+pub struct PodcastSearchTablePopup {
+    component: Table,
+    config: SharedTuiSettings,
+}
+
+impl PodcastSearchTablePopup {
+    pub fn new(config: SharedTuiSettings) -> Self {
+        let component = {
+            let config = config.read();
+            Table::default()
+                .background(config.settings.theme.library_background())
+                .foreground(config.settings.theme.library_foreground())
+                .borders(
+                    Borders::default()
+                        .color(config.settings.theme.library_border())
+                        .modifiers(BorderType::Rounded),
+                )
+                .title(Title::from(" Enter to add feed: ").alignment(HorizontalAlignment::Left))
+                .scroll(true)
+                .highlight_style(
+                    CommonHighlight::default()
+                        .style
+                        .fg(config.settings.theme.library_highlight()),
+                )
+                .highlight_style_inactive(STYLE_REMOVE_REVERSE)
+                .highlight_str(config.settings.theme.style.library.highlight_symbol.clone())
+                .rewind(false)
+                .step(4)
+                .row_height(1)
+                .headers([" Name ", " url "])
+                .column_spacing(3)
+                .widths(&[40, 60])
+                .table(
+                    TableBuilder::default()
+                        .add_col(LineStatic::from("Empty result."))
+                        .add_col(LineStatic::from("Loading..."))
+                        .build(),
+                )
+        };
+
+        Self { component, config }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for PodcastSearchTablePopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        let config = self.config.clone();
+        let keys = &config.read().settings.keys;
+        let cmd_result = match ev {
+            Event::Keyboard(KeyEvent { code: Key::Esc, .. }) => {
+                return Some(Msg::Podcast(PCMsg::SearchItunesCloseCancel));
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.quit.get() => {
+                return Some(Msg::Podcast(PCMsg::SearchItunesCloseCancel));
+            }
+            Event::Keyboard(KeyEvent { code: Key::Up, .. }) => {
+                self.perform(Cmd::Move(Direction::Up))
+            }
+            Event::Keyboard(KeyEvent {
+                code: Key::Down, ..
+            }) => self.perform(Cmd::Move(Direction::Down)),
+
+            Event::Keyboard(keyevent) if keyevent == keys.navigation_keys.down.get() => {
+                self.perform(Cmd::Move(Direction::Down))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.navigation_keys.up.get() => {
+                self.perform(Cmd::Move(Direction::Up))
+            }
+            Event::Keyboard(KeyEvent {
+                code: Key::PageDown,
+                ..
+            }) => self.perform(Cmd::Scroll(Direction::Down)),
+            Event::Keyboard(KeyEvent {
+                code: Key::PageUp, ..
+            }) => self.perform(Cmd::Scroll(Direction::Up)),
+            Event::Keyboard(keyevent) if keyevent == keys.navigation_keys.goto_top.get() => {
+                self.perform(Cmd::GoTo(Position::Begin))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.navigation_keys.goto_bottom.get() => {
+                self.perform(Cmd::GoTo(Position::End))
+            }
+            // Event::Keyboard(KeyEvent {
+            //     code: Key::Tab,
+            //     modifiers: KeyModifiers::NONE,
+            // }) => return Some(Msg::YoutubeSearch(YSMsg::TablePopupNext)),
+            // Event::Keyboard(KeyEvent {
+            //     code: Key::BackTab,
+            //     modifiers: KeyModifiers::SHIFT,
+            // }) => return Some(Msg::YoutubeSearch(YSMsg::TablePopupPrevious)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Enter, ..
+            }) => {
+                if let State::Single(StateValue::Usize(index)) = self.state() {
+                    return Some(Msg::Podcast(PCMsg::SearchItunesCloseOk(index)));
+                }
+                CmdResult::NoChange
+            }
+            _ => CmdResult::NoChange,
+        };
+        match cmd_result {
+            CmdResult::NoChange => None,
+            _ => Some(Msg::ForceRedraw),
+        }
+    }
+}
+
+impl Model {
+    /// Mount a confirmation box to confirm the deletion of a feed via 2 option.
+    pub fn mount_feed_delete_confirm_radio(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::FeedDeleteConfirmRadioPopup,
+            Box::new(FeedDeleteConfirmRadioPopup::new(self.config_tui.clone())),
+            vec![],
+        )?;
+        self.app.active(&Id::FeedDeleteConfirmRadioPopup)?;
+
+        Ok(())
+    }
+
+    /// Unmount the feed deletion confirmation via radio component.
+    pub fn umount_feed_delete_confirm_radio(&mut self) -> Result<()> {
+        self.app.umount(&Id::FeedDeleteConfirmRadioPopup)?;
+
+        Ok(())
+    }
+
+    /// Mount a confirmation box to confirm the deletion of a feed via a specific input.
+    pub fn mount_feed_delete_confirm_input(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::FeedDeleteConfirmInputPopup,
+            Box::new(DeleteConfirmInputPopup::new(
+                &self.config_tui.read(),
+                "You're about the erase all feeds.",
+                Msg::Podcast(PCMsg::FeedsDeleteCloseOk),
+                Msg::Podcast(PCMsg::FeedsDeleteCloseCancel),
+            )),
+            vec![],
+        )?;
+        self.app.active(&Id::FeedDeleteConfirmInputPopup)?;
+
+        Ok(())
+    }
+
+    /// Unmount the feeed deletion confirmation via input component.
+    pub fn umount_feed_delete_confirm_input(&mut self) -> Result<()> {
+        self.app.umount(&Id::FeedDeleteConfirmInputPopup)?;
+
+        Ok(())
+    }
+
+    /// Mount the podcast search component
+    pub fn mount_podcast_search_table(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::PodcastSearchTablePopup,
+            Box::new(PodcastSearchTablePopup::new(self.config_tui.clone())),
+            vec![],
+        )?;
+        self.app.active(&Id::PodcastSearchTablePopup)?;
+        if let Err(e) = self.update_photo() {
+            self.mount_error_popup(e.context("update_photo"));
+        }
+
+        Ok(())
+    }
+
+    pub fn update_podcast_search_table(&mut self) {
+        let mut table: TableBuilder = TableBuilder::default();
+        let mut idx: usize = 0;
+        if let Some(vec) = &self.podcast.search_results {
+            for record in vec {
+                if idx > 0 {
+                    table.add_row();
+                }
+
+                idx += 1;
+
+                let title = record
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "no title found".to_string());
+
+                table
+                    .add_col(LineStatic::styled(title, Style::new().bold()))
+                    .add_col(LineStatic::from(record.url.clone()));
+            }
+            // if self.player.playlist.is_empty() {
+            //     table.add_col(LineStatic::from("0"));
+            //     table.add_col(LineStatic::from("empty playlist"));
+            //     table.add_col(LineStatic::from(""));
+            // }
+        }
+        let table = table.build();
+
+        self.app
+            .attr(
+                &Id::PodcastSearchTablePopup,
+                Attribute::Content,
+                AttrValue::Table(table),
+            )
+            .ok();
+    }
+
+    /// Unmount the podcast search component.
+    pub fn umount_podcast_search_table(&mut self) -> Result<()> {
+        self.app.umount(&Id::PodcastSearchTablePopup)?;
+        if let Err(e) = self.update_photo() {
+            self.mount_error_popup(e.context("update_photo"));
+        }
+
+        Ok(())
+    }
+
+    /// Mount the component to add a podcast.
+    pub fn mount_podcast_add_popup(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::PodcastAddPopup,
+            Box::new(PodcastAddPopup::new(&self.config_tui.read())),
+            vec![],
+        )?;
+
+        self.app.active(&Id::PodcastAddPopup)?;
+
+        Ok(())
+    }
+
+    /// Unmount the component to add a podcast.
+    pub fn umount_podcast_add_popup(&mut self) -> Result<()> {
+        self.app.umount(&Id::PodcastAddPopup)?;
+
+        Ok(())
+    }
+}

@@ -1,0 +1,125 @@
+use anyhow::Result;
+/**
+ * MIT License
+ *
+ * tuifeed - Copyright (c) 2021 Christian Visintin
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+use termusiclib::config::{SharedTuiSettings, v2::tui::theme::styles::ColorTermusic};
+use tui_realm_stdlib::components::Paragraph;
+use tuirealm::{
+    component::{AppComponent, Component},
+    event::{Event, Key, KeyEvent},
+    props::{BorderType, Borders, HorizontalAlignment, TextModifiers, TextStatic, Title},
+};
+
+use crate::ui::ids::Id;
+use crate::ui::model::{Model, UserEvent};
+use crate::ui::msg::{ErrorPopupMsg, Msg};
+
+#[derive(Component)]
+pub struct ErrorPopup {
+    component: Paragraph,
+    config: SharedTuiSettings,
+}
+
+impl ErrorPopup {
+    pub fn new<E: Into<anyhow::Error>>(config: SharedTuiSettings, msg: E) -> Self {
+        let msg = msg.into();
+        error!("Displaying error popup: {msg:?}");
+        // TODO: Consider changing to ":?" to output "Caused By" (and possibly backtrace) OR do a custom printing (copied from anyhow) once more than 4 lines can be displayed in height
+        let msg = format!("{msg:#}");
+
+        let config_r = config.read_recursive();
+        let color = // TODO: make this configurable
+        config_r.settings.theme.get_color_from_theme(ColorTermusic::Red);
+
+        let component = {
+            Paragraph::default()
+            .borders(
+                Borders::default()
+                    .color(color)
+                    .modifiers(BorderType::Rounded),
+            )
+            .title(Title::from(" Error ").alignment(HorizontalAlignment::Center))
+            .foreground(color)
+            .background(config_r.settings.theme.fallback_background())
+            .modifiers(TextModifiers::BOLD)
+            .alignment_horizontal(HorizontalAlignment::Center)
+            .text(TextStatic::from(msg)/* &msg.lines().map(|v| TextSpan::from(v)).collect::<Vec<_>>() */)
+        };
+        drop(config_r);
+
+        Self { component, config }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for ErrorPopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        let config = self.config.clone();
+        let keys = &config.read().settings.keys;
+        match ev {
+            Event::Keyboard(KeyEvent {
+                code: Key::Enter | Key::Esc,
+                ..
+            }) => Some(Msg::ErrorPopup(ErrorPopupMsg::Close)),
+            Event::Keyboard(key) if key == keys.quit.get() => {
+                Some(Msg::ErrorPopup(ErrorPopupMsg::Close))
+            }
+            Event::Keyboard(key) if key == keys.escape.get() => {
+                Some(Msg::ErrorPopup(ErrorPopupMsg::Close))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Model {
+    /// Mount error and give focus to it.
+    ///
+    /// # Panics
+    ///
+    /// If mounting the popup fails.
+    pub fn mount_error_popup<E: Into<anyhow::Error>>(&mut self, err: E) {
+        // unlike other mount functions, this one wraps the actual mounting function and adds a expect
+        // because it is used in many more places.
+        self.mount_error_popup_inner(err)
+            .expect("Expected ErrorPopup to mount correctly");
+    }
+
+    // This should likely be refactored to be "std::error::Error", but see https://github.com/dtolnay/anyhow/issues/63 on why it was easier this way
+    fn mount_error_popup_inner<E: Into<anyhow::Error>>(&mut self, err: E) -> Result<()> {
+        self.app.remount(
+            Id::ErrorPopup,
+            Box::new(ErrorPopup::new(self.config_tui.clone(), err)),
+            vec![],
+        )?;
+        self.app.active(&Id::ErrorPopup)?;
+
+        Ok(())
+    }
+
+    /// Unmount the error popup.
+    pub fn umount_error_popup(&mut self) -> Result<()> {
+        self.app.umount(&Id::ErrorPopup)?;
+
+        Ok(())
+    }
+}

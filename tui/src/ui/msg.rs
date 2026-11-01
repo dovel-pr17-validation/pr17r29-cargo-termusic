@@ -1,0 +1,971 @@
+//! This Module contains all TUI-specific message types.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use termusiclib::player::protobuf::player::GetProgressResponse;
+
+use image::DynamicImage;
+use termusiclib::config::v2::tui::{keys::KeyBinding, theme::styles::ColorTermusic};
+use termusiclib::player::UpdateEvents;
+use termusiclib::player::protobuf::queue::{PlaylistState, SortCriterion, SortDirection};
+use termusiclib::podcast::{PodcastDLResult, PodcastFeed, PodcastSyncResult};
+use termusiclib::songtag::{SongtagSearchResult, TrackDLMsg};
+use termusiclib::track::Track;
+use tokio::sync::mpsc;
+
+use crate::ui::components::TETrack;
+use crate::ui::ids::{IdCEGeneral, IdCETheme, IdConfigEditor, IdKey, IdKeyGlobal, IdKeyOther};
+use crate::ui::model::youtube_options::{YTDLMsg, YoutubeData, YoutubeOptions};
+
+/// Main message type that encapsulates everything else.
+// Note that the style is for each thing to have a sub-type, unless it is top-level like "ForceRedraw".
+#[derive(Clone, PartialEq, Debug)]
+pub enum Msg {
+    ConfigEditor(ConfigEditorMsg),
+    DataBase(DBMsg),
+    Notification(NotificationMsg),
+    GeneralSearch(GSMsg),
+    Layout(MainLayoutMsg),
+    Library(LIMsg),
+    Player(PlayerMsg),
+    Playlist(PLMsg),
+    Podcast(PCMsg),
+    SavePlaylist(SavePlaylistMsg),
+    TagEditor(TEMsg),
+    YoutubeSearch(YSMsg),
+    Xywh(XYWHMsg),
+    LyricMessage(LyricMsg),
+    DeleteConfirm(DeleteConfirmMsg),
+    QuitPopup(QuitPopupMsg),
+    HelpPopup(HelpPopupMsg),
+    SortPopup(SortPopupMsg),
+    ErrorPopup(ErrorPopupMsg),
+
+    /// Same as [`ForceRedraw`](Msg::ForceRedraw), but also updated the drawn cover.
+    UpdatePhoto,
+    /// Force a redraw because of some change.
+    ///
+    /// This is necessary as `Components` do not have access to `Model.redraw`.
+    ///
+    /// For example pushing ARROW DOWN to change the selection in a table.
+    ///
+    /// Note that this message does *not* update the drawn cover.
+    ForceRedraw,
+
+    ReloadTheme,
+
+    ServerReqResponse(ServerReqResponse),
+    StreamUpdate(UpdateEvents),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainLayoutMsg {
+    /// Switch to the Music library view
+    TreeView,
+    /// Switch to the Database view
+    DataBase,
+    /// Switch to the Podcast view
+    Podcast,
+}
+
+/// Player relates messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerMsg {
+    ToggleGapless,
+    TogglePause,
+    VolumeUp,
+    VolumeDown,
+    SpeedUp,
+    SpeedDown,
+    RestartTrack,
+    SeekForward,
+    SeekBackward,
+}
+
+/// Data for [`SavePlaylistMsg::Update`].
+///
+/// This is wrapper struct is necessary so we can overwrite the [`Eq`] matching, as otherwise the
+/// subscriptions will only fire if the path is the *exact* same.
+///
+/// The path given is the one that is reloaded and also focused.
+#[derive(Clone, Debug, Eq, Default)]
+pub struct SPUpdateData {
+    pub path: OsString,
+}
+
+/// `PartialEq` is only used for subscriptions.
+impl PartialEq for SPUpdateData {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Save Playlist Popup related messages
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavePlaylistMsg {
+    /// Show the Popup. Contains the path to write to.
+    ///
+    /// The container path may be a directory or a file.
+    Show(PathBuf),
+    /// Update the "Full Path Label". Contains the filename without extension.
+    Update(SPUpdateData),
+    /// The Popup confirmed to save. Contains the the full path.
+    CloseOk(PathBuf),
+    /// The Popup has been canceled without doing anything.
+    CloseCancel,
+
+    // Playlist exists, overwrite popup
+    /// The Popup has been canceled without doing anything.
+    OverwriteCancel,
+    /// The Popup confirmed to save and overwrite. Contains the full path to save to.
+    OverwriteOk(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XYWHMsg {
+    /// Toggle the hidden / shown status of the displayed image.
+    ToggleHidden,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    ZoomIn,
+    ZoomOut,
+
+    CoverDLResult(CoverDLResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverDLResult {
+    /// Fetching & loading the image was a success, with the image.
+    FetchPhotoSuccess(ImageWrapper),
+    /// Fetching & loading the image has failed, with error message.
+    /// `(ErrorAsString)`
+    FetchPhotoErr(String),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct ImageWrapper {
+    pub data: DynamicImage,
+}
+impl Eq for ImageWrapper {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteConfirmMsg {
+    /// The Delete Confirmation has closed with a negative/no/cancel/abort.
+    CloseCancel,
+    /// The Delete Confirmation has closed with a positive/yes/ok.
+    CloseOk(PathBuf, Option<String>),
+    /// Show a delete confirmation for the given path.
+    Show(PathBuf, Option<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuitPopupMsg {
+    /// Closes the Quit Popup, if it was shown without quitting.
+    CloseCancel,
+    /// Always will directly quit.
+    CloseOk,
+    /// Either shows the Quit Dialog if enabled, or if dialog is disabled, directly quits
+    Show,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpPopupMsg {
+    Show,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortPopupMsg {
+    Show,
+    Close,
+    /// User selected a sort criterion + direction from the menu.
+    Selected(SortCriterion, SortDirection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorPopupMsg {
+    Close,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LyricMsg {
+    Cycle,
+    AdjustDelay(i64),
+
+    TextAreaBlurUp,
+    TextAreaBlurDown,
+}
+
+/// Determine if the value is meant to represent a directory and it content state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IsDir {
+    /// It is not a directory
+    No,
+    /// It is a directory, but it is unknown if it contains anything.
+    YesNotLoaded,
+    /// It is a directory, and it is known to not be empty.
+    YesLoaded,
+    /// It is a directory, and is known to be empty.
+    YesLoadedEmpty,
+}
+
+impl IsDir {
+    #[inline]
+    pub fn is_dir(self) -> bool {
+        !matches!(self, IsDir::No)
+    }
+}
+
+/// Recursive structure which may contain more of itself.
+///
+/// Basically a `tui-realm-treeview` Tree Node, without the extra things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecVec {
+    pub path: PathBuf,
+    pub is_dir: IsDir,
+    pub children: Vec<RecVec>,
+}
+
+/// Data for [`LIMsg::Reload`].
+///
+/// Leaving `change_root_path` as `None` will reload the current root, without changing paths.
+#[derive(Clone, Debug, Eq, Default)]
+pub struct LIReloadData {
+    pub change_root_path: Option<PathBuf>,
+    pub focus_node: Option<String>,
+}
+
+/// `PartialEq` is only used for subscriptions.
+impl PartialEq for LIReloadData {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Data for [`LIMsg::ReloadPath`].
+///
+/// The path given is the one that is reloaded and also focused.
+#[derive(Clone, Debug, Eq, Default)]
+pub struct LIReloadPathData {
+    pub path: PathBuf,
+    pub change_focus: bool,
+}
+
+/// `PartialEq` is only used for subscriptions.
+impl PartialEq for LIReloadPathData {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Data for [`LIMsg::TreeNodeReady`].
+///
+/// The path given is the one that is reloaded and also optionally focused.
+#[derive(Clone, Debug, Eq)]
+pub struct LINodeReady {
+    pub vec: RecVec,
+    pub focus_node: Option<String>,
+}
+
+/// Data returned from this should not be passed around.
+impl Default for LINodeReady {
+    fn default() -> Self {
+        let bogus_recvec = RecVec {
+            path: PathBuf::new(),
+            is_dir: IsDir::No,
+            children: Vec::new(),
+        };
+        Self {
+            vec: bogus_recvec,
+            focus_node: None,
+        }
+    }
+}
+
+/// `PartialEq` is only used for subscriptions.
+impl PartialEq for LINodeReady {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Data for [`LIMsg::TreeNodeReadySub`].
+///
+/// The path given is the one that is reloaded and also focused.
+#[derive(Clone, Debug, Eq)]
+pub struct LINodeReadySub {
+    pub vec: RecVec,
+    pub focus_node: Option<PathBuf>,
+}
+
+/// Data returned from this should not be passed around.
+impl Default for LINodeReadySub {
+    fn default() -> Self {
+        let bogus_recvec = RecVec {
+            path: PathBuf::new(),
+            is_dir: IsDir::No,
+            children: Vec::new(),
+        };
+        Self {
+            vec: bogus_recvec,
+            focus_node: None,
+        }
+    }
+}
+
+/// `PartialEq` is only used for subscriptions.
+impl PartialEq for LINodeReadySub {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Data for [`LIMsg::RequestCurrentNode`].
+///
+/// This should likely be just a Callback fn, but it would also need to satisfy "Eq" and "Clone", which is annoying with dyn traits.
+#[derive(Clone, Debug)]
+pub struct LIReqNode {
+    // This is practically used as a oneshot, but `tokio::sync::oneshot::Sender` is not "Clone", but this one is.
+    pub sender: mpsc::Sender<Option<PathBuf>>,
+}
+
+/// Data returned from this should not be passed around.
+impl Default for LIReqNode {
+    fn default() -> Self {
+        let (bogus_tx, _) = mpsc::channel(1);
+        Self { sender: bogus_tx }
+    }
+}
+
+impl Eq for LIReqNode {}
+
+/// `PartialEq` is only used for subscriptions.
+impl PartialEq for LIReqNode {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LIMsg {
+    /// Run a full reload of the current tree. This will clear the tree until new data is available.
+    Reload(LIReloadData),
+    /// Reload the given path and focus that node (also open everything necessary).
+    ///
+    /// This does not change the tree root.
+    ReloadPath(LIReloadPathData),
+
+    TreeBlur,
+    PlaylistRunDelete,
+    PasteError(String),
+    /// Switch the music root.
+    ///
+    /// Contains the *old* root
+    SwitchRoot(PathBuf),
+    AddRoot(PathBuf),
+    /// Remove the given path as a music root.
+    RemoveRoot(PathBuf),
+
+    /// A requested node is ready from loading.
+    ///
+    /// Replaces the tree root.
+    TreeNodeReady(LINodeReady),
+    /// A requested node is ready to be reloaded within the current tree.
+    ///
+    /// Does not replace the tree root.
+    TreeNodeReadySub(LINodeReadySub),
+
+    /// Get the currently selected node's path and reply to on the given channel.
+    RequestCurrentPath(LIReqNode),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ConfigEditorMsg {
+    CloseCancel,
+    CloseOk,
+    ColorChanged(IdConfigEditor, ColorTermusic),
+    SymbolChanged(IdConfigEditor, String),
+    KeyChange(IdKey, KeyBinding),
+    ConfigChanged,
+    ConfigSaveOk,
+    ConfigSaveCancel,
+
+    Open,
+    ChangeLayout(KFMsg),
+    KeyFocusGlobal(KFMsg),
+    KeyFocusOther(KFMsg),
+    General(KFMsg),
+    Theme(KFMsg),
+    ThemeColorItem(KFMsg),
+
+    ThemeSelectLoad(usize),
+}
+
+/// This array defines the order the IDs listed are displayed and which gains next / previous focus.
+pub const GENERAL_FOCUS_ORDER: &[IdCEGeneral] = &[
+    IdCEGeneral::MusicDir,
+    IdCEGeneral::ExitConfirmation,
+    IdCEGeneral::PlaylistDisplaySymbol,
+    IdCEGeneral::PlaylistRandomTrack,
+    IdCEGeneral::PlaylistRandomAlbum,
+    IdCEGeneral::PodcastDir,
+    IdCEGeneral::PodcastSimulDownload,
+    IdCEGeneral::PodcastMaxRetries,
+    IdCEGeneral::AlbumPhotoAlign,
+    IdCEGeneral::SaveLastPosition,
+    IdCEGeneral::SeekStep,
+    IdCEGeneral::PreviousTrackThreshold,
+    IdCEGeneral::KillDamon,
+    IdCEGeneral::PlayerUseMpris,
+    IdCEGeneral::PlayerUseDiscord,
+    IdCEGeneral::PlayerPort,
+    IdCEGeneral::PlayerAddress,
+    IdCEGeneral::PlayerProtocol,
+    IdCEGeneral::PlayerUDSPath,
+    IdCEGeneral::PlayerBackend,
+    IdCEGeneral::ExtraYtdlpArgs,
+];
+
+/// This array defines the order the IDs listed are displayed and which gains next / previous focus.
+/// Focus handlers may use a subslice when cycling inside one pane, so some entries
+/// may be skipped; for example, the color-item pane skips `ThemeSelectTable`.
+pub const THEME_FOCUS_ORDER: &[IdCETheme] = &[
+    IdCETheme::ThemeSelectTable,
+    IdCETheme::LibraryForeground,
+    IdCETheme::LibraryBackground,
+    IdCETheme::LibraryBorder,
+    IdCETheme::LibraryHighlight,
+    IdCETheme::LibraryHighlightSymbol,
+    IdCETheme::PlaylistForeground,
+    IdCETheme::PlaylistBackground,
+    IdCETheme::PlaylistBorder,
+    IdCETheme::PlaylistHighlight,
+    IdCETheme::PlaylistHighlightSymbol,
+    IdCETheme::CurrentlyPlayingTrackSymbol,
+    IdCETheme::ProgressForeground,
+    IdCETheme::ProgressBackground,
+    IdCETheme::ProgressBorder,
+    IdCETheme::LyricForeground,
+    IdCETheme::LyricBackground,
+    IdCETheme::LyricBorder,
+    IdCETheme::ImportantPopupForeground,
+    IdCETheme::ImportantPopupBackground,
+    IdCETheme::ImportantPopupBorder,
+    IdCETheme::FallbackForeground,
+    IdCETheme::FallbackBackground,
+    IdCETheme::FallbackBorder,
+    IdCETheme::FallbackHighlight,
+];
+
+/// First [`THEME_FOCUS_ORDER`] index used by the color-item pane.
+///
+/// Cycling that pane starts after `ThemeSelectTable`, so the theme table is skipped.
+pub const THEME_COLOR_ITEM_FOCUS_ORDER_START: usize = 1;
+
+/// This array defines the order the IDs listed are displayed and which gains next / previous focus.
+pub const KFGLOBAL_FOCUS_ORDER: &[IdKey] = &[
+    // main layouts
+    IdKey::Global(IdKeyGlobal::LayoutTreeview),
+    IdKey::Global(IdKeyGlobal::LayoutDatabase),
+    IdKey::Global(IdKeyGlobal::LayoutPodcast),
+    // general global keys
+    IdKey::Global(IdKeyGlobal::Quit),
+    IdKey::Global(IdKeyGlobal::Config),
+    IdKey::Global(IdKeyGlobal::Help),
+    IdKey::Global(IdKeyGlobal::SavePlaylist),
+    // global navigation
+    IdKey::Global(IdKeyGlobal::Up),
+    IdKey::Global(IdKeyGlobal::Down),
+    IdKey::Global(IdKeyGlobal::Left),
+    IdKey::Global(IdKeyGlobal::Right),
+    IdKey::Global(IdKeyGlobal::GotoBottom),
+    IdKey::Global(IdKeyGlobal::GotoTop),
+    // global player controls
+    IdKey::Global(IdKeyGlobal::PlayerToggleGapless),
+    IdKey::Global(IdKeyGlobal::PlayerTogglePause),
+    IdKey::Global(IdKeyGlobal::PlayerNext),
+    IdKey::Global(IdKeyGlobal::PlayerPrevious),
+    IdKey::Global(IdKeyGlobal::PlayerRestartTrack),
+    IdKey::Global(IdKeyGlobal::PlayerSeekForward),
+    IdKey::Global(IdKeyGlobal::PlayerSeekBackward),
+    IdKey::Global(IdKeyGlobal::PlayerSpeedUp),
+    IdKey::Global(IdKeyGlobal::PlayerSpeedDown),
+    IdKey::Global(IdKeyGlobal::PlayerVolumeUp),
+    IdKey::Global(IdKeyGlobal::PlayerVolumeDown),
+    // lyric controls
+    IdKey::Global(IdKeyGlobal::LyricAdjustForward),
+    IdKey::Global(IdKeyGlobal::LyricAdjustBackward),
+    IdKey::Global(IdKeyGlobal::LyricCycle),
+    // coverart display adjustments
+    IdKey::Global(IdKeyGlobal::XywhMoveUp),
+    IdKey::Global(IdKeyGlobal::XywhMoveDown),
+    IdKey::Global(IdKeyGlobal::XywhMoveLeft),
+    IdKey::Global(IdKeyGlobal::XywhMoveRight),
+    IdKey::Global(IdKeyGlobal::XywhZoomIn),
+    IdKey::Global(IdKeyGlobal::XywhZoomOut),
+    IdKey::Global(IdKeyGlobal::XywhHide),
+];
+
+/// This array defines the order the IDs listed are displayed and which gains next / previous focus.
+pub const KFOTHER_FOCUS_ORDER: &[IdKey] = &[
+    // library keys
+    IdKey::Other(IdKeyOther::LibraryAddRoot),
+    IdKey::Other(IdKeyOther::LibraryRemoveRoot),
+    IdKey::Other(IdKeyOther::LibrarySwitchRoot),
+    IdKey::Other(IdKeyOther::LibraryDelete),
+    IdKey::Other(IdKeyOther::LibraryLoadDir),
+    IdKey::Other(IdKeyOther::LibraryYank),
+    IdKey::Other(IdKeyOther::LibraryPaste),
+    IdKey::Other(IdKeyOther::LibrarySearch),
+    IdKey::Other(IdKeyOther::LibrarySearchYoutube),
+    IdKey::Other(IdKeyOther::LibraryTagEditor),
+    // playlist keys
+    IdKey::Other(IdKeyOther::PlaylistShuffle),
+    IdKey::Other(IdKeyOther::PlaylistModeCycle),
+    IdKey::Other(IdKeyOther::PlaylistPlaySelected),
+    IdKey::Other(IdKeyOther::PlaylistSearch),
+    IdKey::Other(IdKeyOther::PlaylistSwapUp),
+    IdKey::Other(IdKeyOther::PlaylistSwapDown),
+    IdKey::Other(IdKeyOther::PlaylistDelete),
+    IdKey::Other(IdKeyOther::PlaylistDeleteAll),
+    IdKey::Other(IdKeyOther::PlaylistAddRandomAlbum),
+    IdKey::Other(IdKeyOther::PlaylistAddRandomTracks),
+    IdKey::Other(IdKeyOther::PlaylistSort),
+    // database keys
+    IdKey::Other(IdKeyOther::DatabaseAddAll),
+    IdKey::Other(IdKeyOther::DatabaseAddSelected),
+    // podcast keys
+    IdKey::Other(IdKeyOther::PodcastSearchAddFeed),
+    IdKey::Other(IdKeyOther::PodcastMarkPlayed),
+    IdKey::Other(IdKeyOther::PodcastMarkAllPlayed),
+    IdKey::Other(IdKeyOther::PodcastEpDownload),
+    IdKey::Other(IdKeyOther::PodcastEpDeleteFile),
+    IdKey::Other(IdKeyOther::PodcastDeleteFeed),
+    IdKey::Other(IdKeyOther::PodcastDeleteAllFeeds),
+    IdKey::Other(IdKeyOther::PodcastRefreshFeed),
+    IdKey::Other(IdKeyOther::PodcastRefreshAllFeeds),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KFMsg {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]
+pub enum ConfigEditorLayout {
+    General,
+    ThemeAndColor,
+    KeyGlobal,
+    KeyOther,
+}
+
+impl ConfigEditorLayout {
+    /// Get the Tab names in-order for the Header.
+    // TODO: should we use strum?
+    pub fn choice_array() -> [&'static str; 4] {
+        // Note: keep order in-sync with "CONFIG_EDITOR_TABS_ORDER"!
+        [
+            "General Configuration",
+            "Themes and Colors",
+            "Keys Global",
+            "Keys Other",
+        ]
+    }
+
+    /// Get index for the current value into the [`choice_array`](Self::choice_array) array.
+    pub fn to_array_idx(self) -> usize {
+        match self {
+            Self::General => 0,
+            Self::ThemeAndColor => 1,
+            Self::KeyGlobal => 2,
+            Self::KeyOther => 3,
+        }
+    }
+}
+
+impl Default for ConfigEditorLayout {
+    /// Get the default layout from the [`CONFIG_EDITOR_TABS_ORDER`] array.
+    fn default() -> Self {
+        CONFIG_EDITOR_TABS_ORDER[0]
+    }
+}
+
+impl From<ConfigEditorLayout> for IdConfigEditor {
+    fn from(value: ConfigEditorLayout) -> Self {
+        match value {
+            ConfigEditorLayout::General => IdConfigEditor::General(IdCEGeneral::MusicDir),
+            ConfigEditorLayout::ThemeAndColor => IdConfigEditor::Theme(IdCETheme::ThemeSelectTable),
+            ConfigEditorLayout::KeyGlobal => KFGLOBAL_FOCUS_ORDER[0].into(),
+            ConfigEditorLayout::KeyOther => KFOTHER_FOCUS_ORDER[0].into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedId;
+
+impl TryFrom<IdConfigEditor> for ConfigEditorLayout {
+    type Error = UnsupportedId;
+
+    fn try_from(value: IdConfigEditor) -> Result<Self, Self::Error> {
+        Ok(match value {
+            // Note: keep in sync with all values from "CONFIG_EDITOR_TABS_ORDER"!
+            IdConfigEditor::General(_) => Self::General,
+            IdConfigEditor::Theme(_) => Self::ThemeAndColor,
+            IdConfigEditor::KeyGlobal(_) => Self::KeyGlobal,
+            IdConfigEditor::KeyOther(_) => Self::KeyOther,
+            // it is ensured by tests that all `CONFIG_EDITOR_TABS_ORDER` map
+            // but might still happen with popups
+            _ => return Err(UnsupportedId),
+        })
+    }
+}
+
+/// This array defines the order the Layouts listed are displayed and which gains next / previous focus.
+pub const CONFIG_EDITOR_TABS_ORDER: &[ConfigEditorLayout] = &[
+    ConfigEditorLayout::General,
+    ConfigEditorLayout::ThemeAndColor,
+    ConfigEditorLayout::KeyGlobal,
+    ConfigEditorLayout::KeyOther,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DBMsg {
+    /// Add all Track Results (from view `Tracks`) to the playlist
+    AddAllToPlaylist,
+    /// Add a single Track Result (from view `Tracks`) to the playlist
+    AddPlaylist(usize),
+    /// Add all Results (from view `Result`) to the playlist
+    AddAllResultsToPlaylist,
+    /// Add a single result (from view `Result`) to the playlist
+    AddResultToPlaylist(usize),
+    CriteriaBlurDown,
+    CriteriaBlurUp,
+    /// Search Results (for view `Result`) from a `Database`(view) index
+    SearchResult(SearchCriteria),
+    SearchResultBlurDown,
+    SearchResultBlurUp,
+    /// Serarch Tracks (for view `Tracks`) from a `Result`(view) index
+    SearchTrack(usize),
+    SearchTracksBlurDown,
+    SearchTracksBlurUp,
+
+    AddAllResultsConfirmShow,
+    AddAllResultsConfirmCancel,
+}
+
+/// Playlist Library View messages
+#[derive(Clone, Debug, PartialEq)]
+pub enum PLMsg {
+    NextSong,
+    PrevSong,
+    /// Change focus to the next view
+    PlaylistTableBlurDown,
+    /// Change focus to the previous view
+    PlaylistTableBlurUp,
+    /// Add a directory / file to the playlist
+    Add(PathBuf),
+    /// Remove INDEX from playlist
+    Delete(usize),
+    /// Clear the Playlist
+    DeleteAll,
+    /// Select the next mode in the list
+    ///
+    /// see `termusicplayback::playlist::Loop` for all modes
+    LoopModeCycle,
+    /// Play a specific index
+    PlaySelected(usize),
+    /// Shuffle the current items in the playlist
+    Shuffle,
+    /// Swap a entry at INDEX with +1 (down)
+    SwapDown(usize),
+    /// Swap a entry at INDEX with -1 (up)
+    SwapUp(usize),
+    /// Start choosing random albums to be added to the playlist
+    AddRandomAlbum,
+    /// Start choosing random tracks to be added to the playlist
+    AddRandomTracks,
+
+    /// Notify that a specific track has been loaded and requested to be notified about.
+    TrackNotify(Arc<Track>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GSMsg {
+    PopupShowDatabase,
+    /// Show search for the Library, search in the provided path.
+    PopupShowLibrary(PathBuf),
+    PopupShowPlaylist,
+    PopupShowEpisode,
+    PopupShowPodcast,
+    PopupCloseCancel,
+    InputBlur,
+    PopupUpdateDatabase(String),
+    /// Update the search results with the given pattern in the given path.
+    PopupUpdateLibrary(String, PathBuf),
+    PopupUpdatePlaylist(String),
+    PopupUpdateEpisode(String),
+    PopupUpdatePodcast(String),
+    TableBlur,
+    PopupCloseEpisodeAddPlaylist,
+    PopupCloseDatabaseAddPlaylist,
+    PopupCloseLibraryAddPlaylist,
+    PopupCloseOkLibraryLocate,
+    PopupClosePlaylistPlaySelected,
+    PopupCloseOkPlaylistLocate,
+    PopupCloseOkEpisodeLocate,
+    PopupCloseOkPodcastLocate,
+
+    PlaylistDataReady(Vec<Arc<Track>>),
+    CloseLoading,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum YSMsg {
+    InputPopupShow(PathBuf),
+    InputPopupCloseCancel,
+    InputPopupCloseOk(String, PathBuf),
+
+    ReqNextPage,
+    ReqPreviousPage,
+    PageLoaded(YoutubeData),
+    /// Indicates that the youtube search page load has failed, with error message.
+    ///
+    /// `(ErrorAsString)`
+    PageLoadError(String),
+
+    TablePopupCloseCancel,
+    TablePopupCloseOk(usize, PathBuf),
+
+    /// The youtube search was a success, with all values.
+    YoutubeSearchSuccess(YoutubeOptions),
+    /// Indicates that the youtube search has failed, with error message.
+    ///
+    /// `(ErrorAsString)`
+    YoutubeSearchFail(String),
+
+    Download(YTDLMsg),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TEMsg {
+    /// Open the Tag Editor with the given path.
+    Open(PathBuf),
+    /// Close the Tag Editor without saving.
+    /// Also reload's the Music Library and focuses the current Tag Editor's path.
+    Close,
+    /// Lyric Delete button has been pressed.
+    CounterDeleteOk,
+    /// Lyric Save button has been pressed.
+    CounterSaveOk,
+    /// Embed the data from the given index from the search list into the current track.
+    Embed(usize),
+    /// Embedding has finished.
+    // Box to not increase the size of this enum when not necessary.
+    EmbedDone(Box<TETrack>),
+    /// Embedding has failed.
+    ///
+    /// `(ErrorAsString)`
+    EmbedErr(String),
+
+    /// Focus change.
+    Focus(TFMsg),
+    /// Save the current data into the current track.
+    Save,
+    /// Change the selected lyric data index.
+    SelectLyricOk(usize),
+
+    /// Run a search with the current data.
+    Search,
+    /// Search has finished.
+    SearchLyricResult(SongtagSearchResult),
+
+    /// Download the given index from the search lsit.
+    Download(usize),
+    /// Track download messages.
+    TrackDownloadResult(TrackDLMsg),
+    /// Indicates that the preparation for the track download have failed
+    ///
+    /// `(ErrorAsString)`
+    TrackDownloadPreError(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TFMsg {
+    CounterDeleteBlurDown,
+    CounterDeleteBlurUp,
+    CounterSaveBlurDown,
+    CounterSaveBlurUp,
+    InputArtistBlurDown,
+    InputArtistBlurUp,
+    InputTitleBlurDown,
+    InputTitleBlurUp,
+    InputAlbumBlurDown,
+    InputAlbumBlurUp,
+    InputGenreBlurDown,
+    InputGenreBlurUp,
+    SelectLyricBlurDown,
+    SelectLyricBlurUp,
+    TableLyricOptionsBlurDown,
+    TableLyricOptionsBlurUp,
+    TextareaLyricBlurDown,
+    TextareaLyricBlurUp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PCMsg {
+    PodcastBlurDown,
+    PodcastBlurUp,
+
+    EpisodeBlurDown,
+    EpisodeBlurUp,
+
+    PodcastAddPopupShow,
+    PodcastAddPopupCloseOk(String),
+    PodcastAddPopupCloseCancel,
+    PodcastSelected(usize),
+    DescriptionUpdate,
+    EpisodeAdd(usize),
+    EpisodeMarkPlayed(usize),
+    EpisodeMarkAllPlayed,
+    PodcastRefreshOne(usize),
+    PodcastRefreshAll,
+    EpisodeDownload(usize),
+    EpisodeDeleteFile(usize),
+
+    FeedDeleteShow,
+    FeedDeleteCloseOk,
+    FeedDeleteCloseCancel,
+    FeedsDeleteShow,
+    FeedsDeleteCloseOk,
+    FeedsDeleteCloseCancel,
+
+    SearchItunesCloseCancel,
+    SearchItunesCloseOk(usize),
+    SearchSuccess(Vec<PodcastFeed>),
+    SearchError(String),
+
+    SyncResult(PodcastSyncResult),
+    DLResult(PodcastDLResult),
+}
+
+/// A static-size shared string.
+pub type SharedStaticStr = Arc<str>;
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NotificationMsg {
+    /// Show a status message in the TUI.
+    ///
+    /// `((Title, Text))`
+    MessageShow((SharedStaticStr, SharedStaticStr)),
+    /// Hide a status message in the TUI.
+    ///
+    /// `((Title, Text))`
+    MessageHide((SharedStaticStr, SharedStaticStr)),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchCriteria {
+    Artist,
+    Album,
+
+    // TODO: the values below are current unused
+    Genre,
+    Directory,
+    Playlist,
+}
+
+impl SearchCriteria {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchCriteria::Artist => "artist",
+            SearchCriteria::Album => "album",
+            SearchCriteria::Genre => "genre",
+            SearchCriteria::Directory => "directory",
+            SearchCriteria::Playlist => "playlist",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerReqResponse {
+    GetProgress(GetProgressResponse),
+    FullPlaylist(PlaylistState),
+}
+
+impl Eq for ServerReqResponse {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use pretty_assertions::{assert_eq, assert_ne};
+
+    use crate::ui::{ids::IdKey, msg::CONFIG_EDITOR_TABS_ORDER};
+
+    use super::{KFGLOBAL_FOCUS_ORDER, KFOTHER_FOCUS_ORDER};
+
+    // ensure that assumptions about "KFGLOBAL_FOCUS_ORDER[0]" can be made correctly
+    #[test]
+    // clippy complains that it is always "false", but if the array actually *is* empty, then rust will **NOT** complain on "[0]" access
+    #[allow(clippy::const_is_empty)]
+    fn kfglobal_focus_order_should_be_nonzero() {
+        assert_ne!(KFGLOBAL_FOCUS_ORDER, []);
+    }
+
+    // i dont think there is a compile-time way to ensure only a specific enum variant is used, so test here
+    #[test]
+    fn kfglobal_focus_order_should_only_contain_global() {
+        for entry in KFGLOBAL_FOCUS_ORDER {
+            assert_eq!(
+                std::mem::discriminant(entry),
+                std::mem::discriminant(&IdKey::Global(crate::ui::ids::IdKeyGlobal::Config))
+            );
+        }
+    }
+
+    // ensure that assumptions about "KFOTHER_FOCUS_ORDER[0]" can be made correctly
+    #[test]
+    // clippy complains that it is always "false", but if the array actually *is* empty, then rust will **NOT** complain on "[0]" access
+    #[allow(clippy::const_is_empty)]
+    fn kfother_focus_order_should_be_nonzero() {
+        assert_ne!(KFOTHER_FOCUS_ORDER, []);
+    }
+
+    // i dont think there is a compile-time way to ensure only a specific enum variant is used, so test here
+    #[test]
+    fn kfother_focus_order_should_only_contain_other() {
+        for entry in KFOTHER_FOCUS_ORDER {
+            assert_eq!(
+                std::mem::discriminant(entry),
+                std::mem::discriminant(&IdKey::Other(crate::ui::ids::IdKeyOther::DatabaseAddAll))
+            );
+        }
+    }
+
+    // ensure that assumptions about "CONFIG_EDITOR_TABS_ORDER[0]" can be made correctly
+    #[test]
+    // clippy complains that it is always "false", but if the array actually *is* empty, then rust will **NOT** complain on "[0]" access
+    #[allow(clippy::const_is_empty)]
+    fn config_editor_tabs_order_should_be_nonzero() {
+        assert_ne!(CONFIG_EDITOR_TABS_ORDER, []);
+    }
+
+    #[test]
+    fn config_editor_tabs_order_maps_to_enum() {
+        let mut set = HashSet::new();
+        // there is currently no compile-time way to ensure the array maps fully
+        for id in CONFIG_EDITOR_TABS_ORDER {
+            assert!(
+                set.insert(*id),
+                "Duplicate value in CONFIG_EDITOR_TABS_ORDER2!"
+            );
+        }
+    }
+}

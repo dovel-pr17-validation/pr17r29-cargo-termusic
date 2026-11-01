@@ -1,0 +1,1227 @@
+use anyhow::{Context, Result, bail};
+use parking_lot::RwLock;
+use pathdiff::diff_paths;
+use rand::RngExt;
+use rand::seq::SliceRandom;
+use std::error::Error;
+use std::fmt::{Display, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use termusiclib::config::SharedServerSettings;
+use termusiclib::config::v2::server::LoopMode;
+use termusiclib::new_database::Database;
+use termusiclib::player::PlaylistLoopModeInfo;
+use termusiclib::player::PlaylistShuffledInfo;
+use termusiclib::player::PlaylistSwapInfo;
+use termusiclib::player::UpdateEvents;
+use termusiclib::player::UpdatePlaylistEvents;
+use termusiclib::player::playlist_helpers::PlaylistPlaySpecific;
+use termusiclib::player::playlist_helpers::PlaylistSwapTrack;
+use termusiclib::player::playlist_helpers::PlaylistTrackSource;
+use termusiclib::player::playlist_helpers::{PlaylistAddTrack, PlaylistRemoveTrackIndexed};
+use termusiclib::player::protobuf;
+use termusiclib::player::protobuf::queue::{PlaylistState, SortCriterion, SortDirection};
+use termusiclib::player::{PlaylistAddTrackInfo, PlaylistRemoveTrackInfo};
+use termusiclib::podcast::{db::Database as DBPod, episode::Episode};
+use termusiclib::track::{MediaTypes, Track, TrackData};
+use termusiclib::utils::{filetype_supported, get_app_config_path, get_parent_folder};
+
+use crate::SharedPlaylist;
+use crate::StreamTX;
+use crate::playlist::sorting::{ScoredTrack, score_track, sort_scored};
+
+mod save_load;
+mod sorting;
+
+#[derive(Debug)]
+pub struct Playlist {
+    /// All tracks in the playlist
+    tracks: Vec<Track>,
+    /// Index into `tracks` of which the current playing track is
+    current_track_index: usize,
+    /// Index into `tracks` for the next track to play after the current.
+    ///
+    /// Practically only used for pre-enqueue / pre-fetch / gapless.
+    next_track_index: Option<usize>,
+    /// The loop-/play-mode for the playlist
+    loop_mode: LoopMode,
+    /// Indexes into `tracks` that have been previously been played (for `previous`)
+    played_index: Vec<usize>,
+    /// Sender for the Streaming Updates.
+    stream_tx: StreamTX,
+
+    /// Indicator if we need to save the playlist for interval saving
+    is_modified: bool,
+}
+
+impl Playlist {
+    /// Create a new playlist instance with 0 tracks
+    pub fn new(config: &SharedServerSettings, stream_tx: StreamTX) -> Self {
+        let loop_mode = config.read().settings.player.loop_mode;
+
+        Self {
+            tracks: Vec::new(),
+            loop_mode,
+            current_track_index: 0,
+            played_index: Vec::new(),
+            next_track_index: None,
+            stream_tx,
+            is_modified: false,
+        }
+    }
+
+    /// Create a new Playlist instance that is directly shared
+    ///
+    /// # Errors
+    ///
+    /// see [`load`](Self::load)
+    pub fn new_shared(
+        config: &SharedServerSettings,
+        stream_tx: StreamTX,
+    ) -> Result<SharedPlaylist> {
+        let mut playlist = Self::new(config, stream_tx);
+        playlist.load_apply()?;
+
+        Ok(Arc::new(RwLock::new(playlist)))
+    }
+
+    /// Get the current track to play in this playlist.
+    ///
+    /// Does not modify the playlist.
+    #[must_use]
+    pub fn get_current_track(&self) -> Option<&Track> {
+        self.tracks.get(self.current_track_index)
+    }
+
+    /// Get the current track index to play in this playlist.
+    #[must_use]
+    pub fn get_current_track_index(&self) -> usize {
+        self.current_track_index
+    }
+
+    /// Set the state so that the next track is the current track.
+    ///
+    /// If [`None`] is returned, this playlist is done playing.
+    pub fn next(&mut self, force_next: bool) -> Option<&Track> {
+        debug!("Playlist next");
+        self.played_index.push(self.current_track_index);
+
+        // use next idx if present
+        if let Some(next_idx) = self.next_track_index.take() {
+            self.current_track_index = next_idx;
+            self.is_modified = true;
+
+            return self.get_current_track();
+        }
+        // otherwise, try to generate a new idx
+        self.current_track_index = self.next_index_loopmode(force_next)?;
+        self.is_modified = true;
+
+        self.get_current_track()
+    }
+
+    /// Try to fetch the next track for enqueuing.
+    pub fn fetch_next(&mut self) -> Option<&Track> {
+        if self.next_track_index.is_some() {
+            return self.get_next_track();
+        }
+
+        self.next_track_index = self.next_index_loopmode(false);
+
+        self.get_next_track()
+    }
+
+    /// Set the state so that the previous track is the current track.
+    ///
+    /// Uses `played_index` vec before generating a previous value.
+    pub fn previous(&mut self) -> Option<&Track> {
+        debug!("Playlist previous");
+
+        let previous = match self.played_index.pop() {
+            Some(v) => v,
+            None => self.previous_index_loopmode(),
+        };
+
+        self.current_track_index = previous;
+        self.is_modified = true;
+
+        self.get_current_track()
+    }
+
+    /// Skip to a specific track in the playlist.
+    ///
+    /// # Errors
+    ///
+    /// - if converting u64 to usize fails
+    /// - if the given info's tracks mismatch with the actual playlist
+    pub fn set_play_specific(&mut self, info: &PlaylistPlaySpecific) -> Result<Option<&Track>> {
+        debug!("Playlist specific");
+        let new_index =
+            usize::try_from(info.track_index).context("convert track_index(u64) to usize")?;
+
+        let Some(track_at_idx) = self.tracks.get(new_index) else {
+            bail!("Index {new_index} is out of bound {}", self.tracks.len())
+        };
+
+        Self::check_same_source(&info.id, track_at_idx.inner(), new_index)?;
+
+        self.next_track_index = Some(new_index);
+
+        Ok(self.next(true))
+    }
+
+    /// Get the next track to play in this playlist.
+    ///
+    /// Does not modify the playlist.
+    #[must_use]
+    pub fn get_next_track(&self) -> Option<&Track> {
+        self.next_track_index.and_then(|v| self.tracks.get(v))
+    }
+
+    /// Run [`load`](Self::load), but also apply the values directly to the current instance.
+    ///
+    /// # Errors
+    ///
+    /// See [`load`](Self::load)
+    pub fn load_apply(&mut self) -> Result<()> {
+        let db_path = get_app_config_path()?;
+        let db_podcast = DBPod::new(&db_path)?;
+        let (current_track_index, tracks) = save_load::load(&get_playlist_path()?, &db_podcast)?;
+        self.current_track_index = current_track_index;
+        self.tracks = tracks;
+        self.is_modified = false;
+
+        Ok(())
+    }
+
+    /// Load Tracks from a GRPC response.
+    ///
+    /// Returns `(Position, Tracks[])`.
+    ///
+    /// # Errors
+    ///
+    /// - when converting from u64 grpc values to usize fails
+    /// - when there is no track-id
+    /// - when reading a Track from path or podcast database fails
+    pub fn load_from_grpc(&mut self, info: PlaylistState, podcast_db: &DBPod) -> Result<()> {
+        let current_track_index = usize::try_from(info.current_track_index)
+            .context("convert current_track_index(u64) to usize")?;
+        let mut playlist_items = Vec::with_capacity(info.tracks.len());
+
+        for (idx, track) in info.tracks.into_iter().enumerate() {
+            let at_index_usize =
+                usize::try_from(track.at_index).context("convert at_index(u64) to usize")?;
+            // assume / require that the tracks are ordered correctly, if not just log a error for now
+            if idx != at_index_usize {
+                error!("Non-matching \"index\" and \"at_index\"!");
+            }
+
+            // this case should never happen with "termusic-server", but grpc marks them as "optional"
+            let Some(id) = track.id else {
+                bail!("Track does not have a id, which is required to load!");
+            };
+
+            let track = match PlaylistTrackSource::try_from(id)? {
+                PlaylistTrackSource::Path(v) => Track::read_track_from_path(v)?,
+                PlaylistTrackSource::Url(v) => Track::new_radio(&v),
+                PlaylistTrackSource::PodcastUrl(v) => {
+                    let episode = podcast_db.get_episode_by_url(&v)?;
+                    Track::from_podcast_episode(&episode)
+                }
+            };
+
+            playlist_items.push(track);
+        }
+
+        self.current_track_index = current_track_index;
+        self.tracks = playlist_items;
+        self.is_modified = true;
+
+        Ok(())
+    }
+
+    /// Save the current playlist and playing index to the playlist log
+    ///
+    /// Path in `$config$/playlist.log`
+    ///
+    /// # Errors
+    ///
+    /// Errors could happen when writing files
+    pub fn save(&mut self) -> Result<()> {
+        save_load::save(self, &get_playlist_path()?)?;
+        self.is_modified = false;
+
+        Ok(())
+    }
+
+    /// Run [`Self::save`] only if [`Self::is_modified`] is `true`.
+    ///
+    /// This is mainly used for saving in intervals and not writing if nothing changed.
+    ///
+    /// Returns `true` if saving was performed.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::save`]
+    pub fn save_if_modified(&mut self) -> Result<bool> {
+        if self.is_modified {
+            self.save()?;
+
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Check that the given `info` track source matches the given `track_inner` types.
+    ///
+    /// # Errors
+    ///
+    /// if they dont match
+    fn check_same_source(
+        info: &PlaylistTrackSource,
+        track_inner: &MediaTypes,
+        at_index: usize,
+    ) -> Result<()> {
+        // Error style: "Error; expected INFO_TYPE; found PLAYLIST_TYPE"
+        match (info, track_inner) {
+            (PlaylistTrackSource::Path(file_url), MediaTypes::Track(id)) => {
+                if Path::new(&file_url) != id.path() {
+                    bail!(
+                        "Path mismatch, expected \"{file_url}\" at \"{at_index}\", found \"{}\"",
+                        id.path().display()
+                    );
+                }
+            }
+            (PlaylistTrackSource::Url(file_url), MediaTypes::Radio(id)) => {
+                if file_url != id.url() {
+                    bail!(
+                        "URI mismatch, expected \"{file_url}\" at \"{at_index}\", found \"{}\"",
+                        id.url()
+                    );
+                }
+            }
+            (PlaylistTrackSource::PodcastUrl(file_url), MediaTypes::Podcast(id)) => {
+                if file_url != id.url() {
+                    bail!(
+                        "URI mismatch, expected \"{file_url}\" at \"{at_index}\", found \"{}\"",
+                        id.url()
+                    );
+                }
+            }
+            (expected, got) => {
+                bail!(
+                    "Type mismatch, expected \"{expected:#?}\" at \"{at_index}\" found \"{got:#?}\""
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the next track index based on the [`LoopMode`] used.
+    fn next_index_loopmode(&self, force_next: bool) -> Option<usize> {
+        let mut next_track_index = self.current_track_index;
+        match self.loop_mode {
+            LoopMode::Track => {}
+            LoopMode::Playlist => {
+                next_track_index += 1;
+                if next_track_index >= self.len() {
+                    next_track_index = 0;
+                }
+            }
+            LoopMode::PlaylistOnce => {
+                next_track_index += 1;
+                if next_track_index >= self.len() {
+                    if force_next {
+                        next_track_index = 0;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            LoopMode::Random => {
+                next_track_index = self.get_random_index();
+            }
+        }
+        Some(next_track_index)
+    }
+
+    /// Get the previous track index based on the [`LoopMode`].
+    fn previous_index_loopmode(&self) -> usize {
+        match self.loop_mode {
+            LoopMode::Track => self.current_track_index,
+            // doing both with one impl is fine as long as we dont have a "reverse play" option
+            LoopMode::Playlist | LoopMode::PlaylistOnce => {
+                if self.current_track_index == 0 {
+                    self.len() - 1
+                } else {
+                    self.current_track_index - 1
+                }
+            }
+            LoopMode::Random => self.get_random_index(),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tracks.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+    }
+
+    /// Swap specific indexes, sends swap event.
+    ///
+    /// # Errors
+    ///
+    /// - if either index `a` or `b` are out-of-bounds
+    ///
+    /// # Panics
+    ///
+    /// If `usize` cannot be converted to `u64`
+    pub fn swap(&mut self, index_a: usize, index_b: usize) -> Result<()> {
+        // "swap" panics if a index is out-of-bounds
+        if index_a.max(index_b) >= self.tracks.len() {
+            bail!("Index {} not within tracks bounds", index_a.max(index_b));
+        }
+
+        self.tracks.swap(index_a, index_b);
+
+        // Update current track index too if it is the currently playing track, so that we dont continue somewhere else.
+        // TODO: also update `played_index`vec after swapping
+        if self.current_track_index == index_a {
+            self.current_track_index = index_b;
+        } else if self.current_track_index == index_b {
+            self.current_track_index = index_a;
+        }
+
+        let index_a = u64::try_from(index_a).unwrap();
+        let index_b = u64::try_from(index_b).unwrap();
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistSwapTracks(PlaylistSwapInfo {
+            index_a,
+            index_b,
+        }));
+        self.is_modified = true;
+
+        Ok(())
+    }
+
+    /// Get the current track's Path/Url.
+    // TODO: refactor this function to likely return either a consistent URI format or a enum
+    // TODO: refactor to return a reference if possible
+    fn get_current_track_internal(&mut self) -> Option<String> {
+        let mut result = None;
+        if let Some(track) = self.get_current_track() {
+            match track.inner() {
+                MediaTypes::Track(track_data) => {
+                    result = Some(track_data.path().to_string_lossy().to_string());
+                }
+                MediaTypes::Radio(radio_track_data) => {
+                    result = Some(radio_track_data.url().to_string());
+                }
+                MediaTypes::Podcast(podcast_track_data) => {
+                    result = Some(podcast_track_data.url().to_string());
+                }
+            }
+        }
+        result
+    }
+
+    /// Cycle through the loop modes and return the new mode.
+    ///
+    /// order:
+    /// [`Random`](LoopMode::Random) -> [`Playlist`](LoopMode::Playlist)
+    /// [`Playlist`](LoopMode::Playlist) -> [`PlaylistOnce`](LoopMode::PlaylistOnce)
+    /// [`PlaylistOnce`](LoopMode::PlaylistOnce) -> [`Single`](LoopMode::Track)
+    /// [`Single`](LoopMode::Track) -> [`Random`](LoopMode::Random)
+    pub fn cycle_loop_mode(&mut self) -> LoopMode {
+        let new_mode = match self.loop_mode {
+            LoopMode::Random => LoopMode::Playlist,
+            LoopMode::Playlist => LoopMode::PlaylistOnce,
+            LoopMode::PlaylistOnce => LoopMode::Track,
+            LoopMode::Track => LoopMode::Random,
+        };
+
+        self.set_loop_mode(new_mode);
+
+        self.loop_mode
+    }
+
+    /// Set a specific [`LoopMode`], also sends a event that the mode changed.
+    /// Only sets & sends a event if the new mode is not the same as the old one.
+    pub fn set_loop_mode(&mut self, new_mode: LoopMode) -> LoopMode {
+        // dont set and dont send a event if the mode is the same
+        if new_mode == self.loop_mode {
+            return self.loop_mode;
+        }
+
+        self.loop_mode = new_mode;
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistLoopMode(
+            PlaylistLoopModeInfo::from(self.loop_mode),
+        ));
+
+        self.loop_mode
+    }
+
+    /// Export the current playlist to a `.m3u` playlist file.
+    ///
+    /// Might be confused with [save](Self::save).
+    ///
+    /// # Errors
+    /// Error could happen when writing file to local disk.
+    pub fn save_m3u(&self, filename: &Path) -> Result<()> {
+        if self.tracks.is_empty() {
+            bail!("Unable to save since the playlist is empty.");
+        }
+
+        let parent_folder = get_parent_folder(filename);
+
+        let m3u = self.get_m3u_file(&parent_folder);
+
+        std::fs::write(filename, m3u)?;
+        Ok(())
+    }
+
+    /// Generate the m3u's file content.
+    ///
+    /// All Paths are relative to the `parent_folder` directory.
+    fn get_m3u_file(&self, parent_folder: &Path) -> String {
+        let mut m3u = String::from("#EXTM3U\n");
+        for track in &self.tracks {
+            let file = match track.inner() {
+                MediaTypes::Track(track_data) => {
+                    let path_relative = diff_paths(track_data.path(), parent_folder);
+
+                    path_relative.map_or_else(
+                        || track_data.path().to_string_lossy(),
+                        |v| v.to_string_lossy().to_string().into(),
+                    )
+                }
+                MediaTypes::Radio(radio_track_data) => radio_track_data.url().into(),
+                MediaTypes::Podcast(podcast_track_data) => podcast_track_data.url().into(),
+            };
+
+            let _ = writeln!(m3u, "{file}");
+        }
+        m3u
+    }
+
+    /// Add a podcast episode to the playlist.
+    ///
+    /// # Panics
+    ///
+    /// This should never happen as a podcast url has already been a string, so conversion should not fail
+    pub fn add_episode(&mut self, ep: &Episode) {
+        let track = Track::from_podcast_episode(ep);
+
+        let url = track.as_podcast().unwrap().url();
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistAddTrack(
+            PlaylistAddTrackInfo {
+                at_index: u64::try_from(self.tracks.len()).unwrap(),
+                // Note: Safe unwrap, as a podcast uri is always a uri, not a path (which has been a string before)
+                tracks: vec![PlaylistTrackSource::PodcastUrl(url.to_owned())],
+            },
+        ));
+
+        self.tracks.push(track);
+        self.is_modified = true;
+    }
+
+    /// Add many Paths/Urls to the playlist.
+    ///
+    /// # Errors
+    /// - When invalid inputs are given
+    /// - When the file(s) cannot be read correctly
+    // TODO: this function is unused, maybe cull it?
+    pub fn add_playlist<T: AsRef<str>>(&mut self, vec: &[T]) -> Result<(), PlaylistAddErrorVec> {
+        let mut errors = PlaylistAddErrorVec::default();
+        for item in vec {
+            // TODO: actually make use of PlaylistAddTrackInfo::tracks being a vec, instead of always sending only one per event
+            let Err(err) = self.add_track(item) else {
+                continue;
+            };
+            errors.push(err);
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        Ok(())
+    }
+
+    /// Add a single Path/Url to the playlist
+    ///
+    /// # Errors
+    /// - When invalid inputs are given (non-existing path, unsupported file types, etc)
+    ///
+    /// # Panics
+    ///
+    /// If `usize` cannot be converted to `u64`
+    pub fn add_track<T: AsRef<str>>(&mut self, track: &T) -> Result<(), PlaylistAddError> {
+        let track_str = track.as_ref();
+        if track_str.starts_with("http") {
+            let track = Self::track_from_uri(track_str);
+            self.tracks.push(track);
+            self.is_modified = true;
+            return Ok(());
+        }
+
+        let track = Self::track_from_path(track_str)?;
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistAddTrack(
+            PlaylistAddTrackInfo {
+                at_index: u64::try_from(self.tracks.len()).unwrap(),
+                tracks: vec![PlaylistTrackSource::Path(track_str.to_string())],
+            },
+        ));
+
+        self.tracks.push(track);
+        self.is_modified = true;
+
+        Ok(())
+    }
+
+    /// Add tracks for testing.
+    /// This means those Tracks may or may not exist on the file system or in the database.
+    ///
+    /// Also does not send any event.
+    #[cfg(test)]
+    fn add_track_test(&mut self, track: Track) {
+        self.tracks.push(track);
+        self.is_modified = true;
+    }
+
+    /// Convert [`PlaylistTrackSource`] to [`Track`] by calling the correct functions.
+    ///
+    /// This mainly exist to de-duplicate this match and resulting error handling.
+    fn source_to_track(track_location: &PlaylistTrackSource, db_pod: &DBPod) -> Result<Track> {
+        let track = match track_location {
+            PlaylistTrackSource::Path(path) => Self::track_from_path(path)?,
+            PlaylistTrackSource::Url(uri) => Self::track_from_uri(uri),
+            PlaylistTrackSource::PodcastUrl(uri) => Self::track_from_podcasturi(uri, db_pod)?,
+        };
+
+        Ok(track)
+    }
+
+    /// Add Paths / Urls from the music service
+    ///
+    /// # Errors
+    ///
+    /// On error on a specific track, the error will be collected and the remaining tracks will be tried to be added.
+    ///
+    /// - if adding a track results in a error (path not found, unsupported file types, not enough permissions, etc)
+    ///
+    /// # Panics
+    ///
+    /// If `usize` cannot be converted to `u64`
+    pub fn add_tracks(
+        &mut self,
+        tracks: PlaylistAddTrack,
+        db_pod: &DBPod,
+    ) -> Result<(), PlaylistAddErrorCollection> {
+        self.tracks.reserve(tracks.tracks.len());
+        let at_index = usize::try_from(tracks.at_index).unwrap();
+        // collect non-fatal errors to continue adding the rest of the tracks
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+
+        info!(
+            "Trying to add {} tracks to the playlist",
+            tracks.tracks.len()
+        );
+
+        let mut pushed_tracks = Vec::with_capacity(tracks.tracks.len());
+
+        if at_index >= self.len() {
+            // insert tracks at the end
+            for track_location in tracks.tracks {
+                let track = match Self::source_to_track(&track_location, db_pod) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!("Error adding track: {err}");
+                        errors.push(err);
+                        continue;
+                    }
+                };
+
+                pushed_tracks.push(track_location);
+
+                self.tracks.push(track);
+                self.is_modified = true;
+            }
+        } else {
+            let mut at_index = at_index;
+            // insert tracks at position
+            for track_location in tracks.tracks {
+                let track = match Self::source_to_track(&track_location, db_pod) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!("Error adding track: {err}");
+                        errors.push(err);
+                        continue;
+                    }
+                };
+
+                pushed_tracks.push(track_location);
+
+                self.tracks.insert(at_index, track);
+                self.is_modified = true;
+                at_index += 1;
+            }
+        }
+
+        let added_tracks = pushed_tracks.len();
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistAddTrack(
+            PlaylistAddTrackInfo {
+                at_index: u64::try_from(at_index).unwrap(),
+                tracks: pushed_tracks,
+            },
+        ));
+
+        info!("Added {} tracks with {} errors", added_tracks, errors.len());
+
+        if !errors.is_empty() {
+            return Err(PlaylistAddErrorCollection::from(errors));
+        }
+
+        Ok(())
+    }
+
+    /// Remove Tracks from the music service
+    ///
+    /// # Errors
+    ///
+    /// - if the `at_index` is not within `self.tracks` bounds
+    /// - if `at_index + tracks.len` is not within bounds
+    /// - if the tracks type and URI mismatch
+    ///
+    /// # Panics
+    ///
+    /// If `usize` cannot be converted to `u64`
+    pub fn remove_tracks(&mut self, tracks: PlaylistRemoveTrackIndexed) -> Result<()> {
+        let at_index = usize::try_from(tracks.at_index).unwrap();
+
+        if at_index >= self.tracks.len() {
+            bail!(
+                "at_index is higher than the length of the playlist! at_index is \"{at_index}\" and playlist length is \"{}\"",
+                self.tracks.len()
+            );
+        }
+
+        if at_index + tracks.tracks.len().saturating_sub(1) >= self.tracks.len() {
+            bail!(
+                "at_index + tracks to remove is higher than the length of the playlist! playlist length is \"{}\"",
+                self.tracks.len()
+            );
+        }
+
+        for input_track in tracks.tracks {
+            // verify that it is the track to be removed via id matching
+            let Some(track_at_idx) = self.tracks.get(at_index) else {
+                // this should not happen as it is verified before the loop, but just in case
+                bail!("Failed to get track at index \"{at_index}\"");
+            };
+
+            Self::check_same_source(&input_track, track_at_idx.inner(), at_index)?;
+
+            // verified that at index "at_index" the track is of the type and has the URI that was requested to be removed
+            self.handle_remove(at_index);
+
+            self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistRemoveTrack(
+                PlaylistRemoveTrackInfo {
+                    at_index: u64::try_from(at_index).unwrap(),
+                    trackid: input_track,
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Create a Track from a given Path
+    #[allow(clippy::unnecessary_debug_formatting)] // we want debug information about a path (especially have it escaped)
+    fn track_from_path(path_str: &str) -> Result<Track, PlaylistAddError> {
+        let path = Path::new(path_str);
+
+        if !filetype_supported(path) {
+            error!("unsupported filetype: {path:#?}");
+            let p = path.to_path_buf();
+            let ext = path.extension().map(|v| v.to_string_lossy().to_string());
+            return Err(PlaylistAddError::UnsupportedFileType(ext, p));
+        }
+
+        if !path.exists() {
+            return Err(PlaylistAddError::PathDoesNotExist(path.to_path_buf()));
+        }
+
+        let track = Track::read_track_from_path(path)
+            .map_err(|err| PlaylistAddError::ReadError(err, path.to_path_buf()))?;
+
+        Ok(track)
+    }
+
+    /// Create a Track from a given uri (radio only)
+    fn track_from_uri(uri: &str) -> Track {
+        Track::new_radio(uri)
+    }
+
+    /// Create a Track from a given podcast uri
+    fn track_from_podcasturi(uri: &str, db_pod: &DBPod) -> Result<Track> {
+        let ep = db_pod.get_episode_by_url(uri)?;
+        let track = Track::from_podcast_episode(&ep);
+
+        Ok(track)
+    }
+
+    /// Swap tracks based on [`PlaylistSwapTrack`]
+    ///
+    /// # Errors
+    ///
+    /// - if either the `a` or `b` indexes are not within bounds
+    /// - if the indexes cannot be converted to `usize`
+    ///
+    /// # Panics
+    ///
+    /// If `usize` cannot be converted to `u64`
+    pub fn swap_tracks(&mut self, info: &PlaylistSwapTrack) -> Result<()> {
+        let index_a =
+            usize::try_from(info.index_a).context("Failed to convert index_a to usize")?;
+        let index_b =
+            usize::try_from(info.index_b).context("Failed to convert index_b to usize")?;
+
+        self.swap(index_a, index_b)?;
+
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn tracks(&self) -> &Vec<Track> {
+        &self.tracks
+    }
+
+    /// Remove the track at `index`. Does not modify `current_track`.
+    ///
+    /// # Panics
+    ///
+    /// if usize cannot be converted to u64
+    pub fn remove(&mut self, index: usize) {
+        let Some(track) = self.tracks.get(index) else {
+            error!("Index {index} out of bound {}", self.tracks.len());
+            return;
+        };
+
+        let track_source = track.as_track_source();
+
+        self.handle_remove(index);
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistRemoveTrack(
+            PlaylistRemoveTrackInfo {
+                at_index: u64::try_from(index).unwrap(),
+                trackid: track_source,
+            },
+        ));
+    }
+
+    /// Internal common `remove` handling, does not send a event
+    fn handle_remove(&mut self, index: usize) {
+        self.tracks.remove(index);
+
+        // Handle index
+        if index <= self.current_track_index {
+            // nothing needs to be done if the index is already 0
+            if self.current_track_index != 0 {
+                self.current_track_index -= 1;
+            }
+        }
+    }
+
+    /// Clear the current playlist.
+    /// This does not stop the playlist or clear [`current_track`](Self::current_track).
+    pub fn clear(&mut self) {
+        self.tracks.clear();
+        self.played_index.clear();
+        self.next_track_index.take();
+        self.current_track_index = 0;
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistCleared);
+    }
+
+    /// Shuffle the playlist
+    ///
+    /// # Panics
+    ///
+    /// see [`as_grpc_playlist_tracks#Errors`](Self::as_grpc_playlist_tracks)
+    pub fn shuffle(&mut self) {
+        let current_track_file = self.get_current_track_internal();
+
+        self.tracks.shuffle(&mut rand::rng());
+        self.is_modified = true;
+
+        if let Some(current_track_file) = current_track_file
+            && let Some(index) = self.find_index_from_file(&current_track_file)
+        {
+            self.current_track_index = index;
+        }
+
+        self.next_track_index = None;
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistShuffled(
+            PlaylistShuffledInfo {
+                state: self.as_grpc_playlist_tracks().unwrap(),
+            },
+        ));
+    }
+
+    /// Reorder the playlist by `criterion` + `direction` and emit `PlaylistShuffled`.
+    ///
+    /// Ties on non-alphanumeric criteria are broken by track title (natural sort).
+    /// Mirrors `shuffle()` but with deterministic ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `as_grpc_playlist_tracks` fails (should not happen in practice).
+    pub fn sort_by_mode(
+        &mut self,
+        criterion: SortCriterion,
+        direction: SortDirection,
+        db: &Database,
+    ) {
+        let current_track_file = self.get_current_track_internal();
+        let now = if criterion == SortCriterion::Frecency {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        } else {
+            0
+        };
+
+        // take the original vec so we can consume tracks without cloning
+        let orig_track = std::mem::take(&mut self.tracks);
+
+        // Another vec is necessary as score_track requires the returned key
+        // to not be tied to a lifetime.
+        let mut scored: Vec<ScoredTrack> = orig_track
+            .into_iter()
+            .map(|t| score_track(t, criterion, db, now))
+            .collect();
+
+        sort_scored(&mut scored, criterion, direction);
+
+        self.tracks = scored.into_iter().map(Into::into).collect();
+        self.is_modified = true;
+
+        // Restore current track index
+        if let Some(current_track_file) = current_track_file
+            && let Some(index) = self.find_index_from_file(&current_track_file)
+        {
+            self.current_track_index = index;
+        }
+
+        self.next_track_index = None;
+
+        self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistShuffled(
+            PlaylistShuffledInfo {
+                state: self.as_grpc_playlist_tracks().unwrap(),
+            },
+        ));
+    }
+
+    /// Get the current tracks and state as a GRPC [`PlaylistState`] object.
+    ///
+    /// # Errors
+    ///
+    /// - if some track does not have a file-id
+    /// - converting usize to u64 fails
+    pub fn as_grpc_playlist_tracks(&self) -> Result<PlaylistState> {
+        let tracks = self
+            .tracks()
+            .iter()
+            .enumerate()
+            .map(|(idx, track)| {
+                let at_index = u64::try_from(idx).context("track index(usize) to u64")?;
+                let track_source = track.as_track_source();
+
+                Ok(protobuf::queue::PlaylistTrack {
+                    at_index,
+                    id: Some(track_source.into()),
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(PlaylistState {
+            current_track_index: u64::try_from(self.current_track_index)
+                .context("current_track_index(usize) to u64")?,
+            tracks,
+        })
+    }
+
+    /// Find the index in the playlist for `item`, if it exists there.
+    fn find_index_from_file(&self, item: &str) -> Option<usize> {
+        for (index, track) in self.tracks.iter().enumerate() {
+            let file = match track.inner() {
+                MediaTypes::Track(track_data) => track_data.path().to_string_lossy(),
+                MediaTypes::Radio(radio_track_data) => radio_track_data.url().into(),
+                MediaTypes::Podcast(podcast_track_data) => podcast_track_data.url().into(),
+            };
+            if file == item {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Get a random index in the playlist.
+    fn get_random_index(&self) -> usize {
+        let mut random_index = self.current_track_index;
+
+        if self.len() <= 1 {
+            return 0;
+        }
+
+        let mut rng = rand::rng();
+        while self.current_track_index == random_index {
+            random_index = rng.random_range(0..self.len());
+        }
+
+        random_index
+    }
+
+    /// Remove all tracks from the playlist that dont exist on the disk.
+    ///
+    /// # Panics
+    ///
+    /// if usize cannot be converted to u64
+    pub fn remove_deleted_items(&mut self) {
+        if let Some(current_track_file) = self.get_current_track_internal() {
+            let len = self.tracks.len();
+            let old_tracks = std::mem::replace(&mut self.tracks, Vec::with_capacity(len));
+
+            for track in old_tracks {
+                let Some(path) = track.as_track().map(TrackData::path) else {
+                    continue;
+                };
+
+                if path.exists() {
+                    self.tracks.push(track);
+                    continue;
+                }
+
+                let track_source = track.as_track_source();
+
+                // the index of the playlist where this item is deleted
+                // this must be the index after other indexes might have been already deleted
+                // ie if 0 is deleted, then the next element is also index 0
+                // also ".len" is safe to use here as it is always 1 higher than the max index of the retained elements
+                let deleted_idx = self.tracks.len();
+
+                // NOTE: this function may send many events very quickly (for example on a folder delete), which could overwhelm the broadcast channel on a low capacity value
+                self.send_stream_ev_pl(UpdatePlaylistEvents::PlaylistRemoveTrack(
+                    PlaylistRemoveTrackInfo {
+                        at_index: u64::try_from(deleted_idx).unwrap(),
+                        trackid: track_source,
+                    },
+                ));
+                self.is_modified = true;
+            }
+
+            match self.find_index_from_file(&current_track_file) {
+                Some(new_index) => self.current_track_index = new_index,
+                None => self.current_track_index = 0,
+            }
+        }
+    }
+
+    /// Send Playlist stream events with consistent error handling
+    fn send_stream_ev_pl(&self, ev: UpdatePlaylistEvents) {
+        // there is only one error case: no receivers
+        if self
+            .stream_tx
+            .send(UpdateEvents::PlaylistChanged(ev))
+            .is_err()
+        {
+            debug!("Stream Event not send: No Receivers");
+        }
+    }
+}
+
+const PLAYLIST_SAVE_FILENAME: &str = "playlist.log";
+
+fn get_playlist_path() -> Result<PathBuf> {
+    let mut path = get_app_config_path()?;
+    path.push(PLAYLIST_SAVE_FILENAME);
+
+    Ok(path)
+}
+
+/// Error collections for [`Playlist::add_tracks`].
+#[derive(Debug)]
+pub struct PlaylistAddErrorCollection {
+    pub errors: Vec<anyhow::Error>,
+}
+
+impl Display for PlaylistAddErrorCollection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "There are {} Errors adding tracks to the playlist: [",
+            self.errors.len()
+        )?;
+
+        for err in &self.errors {
+            writeln!(f, "  {err},")?;
+        }
+
+        write!(f, "]")
+    }
+}
+
+impl Error for PlaylistAddErrorCollection {}
+
+impl From<Vec<anyhow::Error>> for PlaylistAddErrorCollection {
+    fn from(value: Vec<anyhow::Error>) -> Self {
+        Self {
+            errors: value.into_iter().map(|err| anyhow::anyhow!(err)).collect(),
+        }
+    }
+}
+
+// NOTE: this is not "thiserror" due to custom "Display" impl (the "Option" handling)
+/// Error for when [`Playlist::add_track`] fails
+#[derive(Debug)]
+pub enum PlaylistAddError {
+    /// `(FileType, Path)`
+    UnsupportedFileType(Option<String>, PathBuf),
+    /// `(Path)`
+    PathDoesNotExist(PathBuf),
+    /// Generic Error for when reading the track fails
+    /// `(OriginalError, Path)`
+    ReadError(anyhow::Error, PathBuf),
+}
+
+impl Display for PlaylistAddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to add to playlist because of: {}",
+            match self {
+                Self::UnsupportedFileType(ext, path) => {
+                    let ext = if let Some(ext) = ext {
+                        format!("Some({ext})")
+                    } else {
+                        "None".into()
+                    };
+                    format!("Unsupported File type \"{ext}\" at \"{}\"", path.display())
+                }
+                Self::PathDoesNotExist(path) => {
+                    format!("Path does not exist: \"{}\"", path.display())
+                }
+                Self::ReadError(err, path) => {
+                    format!("{err} at \"{}\"", path.display())
+                }
+            }
+        )
+    }
+}
+
+impl Error for PlaylistAddError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        if let Self::ReadError(orig, _) = self {
+            return Some(orig.as_ref());
+        }
+
+        None
+    }
+}
+
+/// Error for when [`Playlist::add_playlist`] fails
+#[derive(Debug, Default)]
+pub struct PlaylistAddErrorVec(Vec<PlaylistAddError>);
+
+impl PlaylistAddErrorVec {
+    pub fn push(&mut self, err: PlaylistAddError) {
+        self.0.push(err);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Display for PlaylistAddErrorVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{} Error(s) happened:", self.0.len())?;
+        for err in &self.0 {
+            writeln!(f, "  - {err}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Error for PlaylistAddErrorVec {}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use termusiclib::{
+        player::playlist_helpers::PlaylistTrackSource,
+        track::{MediaTypes, PodcastTrackData, RadioTrackData, TrackData},
+    };
+
+    use super::Playlist;
+
+    #[test]
+    fn should_pass_check_info() {
+        let path = "/somewhere/file.mp3".to_string();
+        let path2 = PathBuf::from(&path);
+        Playlist::check_same_source(
+            &PlaylistTrackSource::Path(path),
+            &MediaTypes::Track(TrackData::new(path2)),
+            0,
+        )
+        .unwrap();
+
+        let uri = "http://some.radio.com/".to_string();
+        let uri2 = uri.clone();
+        Playlist::check_same_source(
+            &PlaylistTrackSource::Url(uri),
+            &MediaTypes::Radio(RadioTrackData::new(uri2)),
+            0,
+        )
+        .unwrap();
+
+        let uri = "http://some.podcast.com/".to_string();
+        let uri2 = uri.clone();
+        Playlist::check_same_source(
+            &PlaylistTrackSource::PodcastUrl(uri),
+            &MediaTypes::Podcast(PodcastTrackData::new(uri2)),
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn should_err_on_type_mismatch() {
+        let path = "/somewhere/file.mp3".to_string();
+        let path2 = path.clone();
+        Playlist::check_same_source(
+            &PlaylistTrackSource::Path(path),
+            &MediaTypes::Radio(RadioTrackData::new(path2)),
+            0,
+        )
+        .unwrap_err();
+    }
+}

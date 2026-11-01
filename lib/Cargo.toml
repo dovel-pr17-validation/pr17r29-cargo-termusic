@@ -1,0 +1,85 @@
+[package]
+name = "termusic-lib"
+description = "library to support termusic."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+
+[lib]
+name = "termusiclib"
+path = "src/lib.rs"
+doctest = false
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+ahash.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+bytes.workspace = true
+bytesize.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+hex.workspace = true
+id3.workspace = true
+indoc.workspace = true
+image.workspace = true
+include_dir.workspace = true
+libaes.workspace = true
+log.workspace = true
+lofty.workspace = true
+md5.workspace = true
+num-bigint.workspace = true
+opml.workspace = true
+parking_lot.workspace = true
+quick-xml.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rfc822_sanitizer.workspace = true
+rss.workspace = true
+rusqlite.workspace = true
+sanitize-filename.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_content_ref.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+shellexpand.workspace = true
+toml.workspace = true
+tuirealm.workspace = true
+unicode-segmentation.workspace = true
+urlencoding.workspace = true
+viuer.workspace = true
+walkdir.workspace = true
+ytd-rs.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+lru.workspace = true
+either.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+
+[features]
+default = ["config-v1-compat"]
+config-v1-compat = []
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

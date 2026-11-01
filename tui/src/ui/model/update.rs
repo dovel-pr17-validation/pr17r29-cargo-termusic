@@ -1,0 +1,1254 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
+use termusiclib::player::{
+    PlayerProgress, RunningStatus, UpdateEvents, UpdatePlaylistEvents, clamp_u16,
+};
+use termusiclib::podcast::{PodcastDLResult, PodcastSyncResult};
+use termusiclib::track::MediaTypesSimple;
+use tuirealm::props::{AttrValueRef, Attribute, QueryResult};
+
+use crate::ui::ids::Id;
+use crate::ui::model::youtube_options::YTDLMsg;
+use crate::ui::msg::{
+    CoverDLResult, DBMsg, DeleteConfirmMsg, ErrorPopupMsg, GSMsg, HelpPopupMsg, LIMsg, LyricMsg,
+    MainLayoutMsg, Msg, NotificationMsg, PCMsg, PLMsg, PlayerMsg, QuitPopupMsg, SavePlaylistMsg,
+    ServerReqResponse, SortPopupMsg, XYWHMsg, YSMsg,
+};
+use crate::ui::tui_cmd::TuiCmd;
+use crate::ui::{Model, model::TermusicLayout};
+
+impl Model {
+    #[allow(clippy::too_many_lines)]
+    pub fn update(&mut self, msg: Msg) {
+        // Set redraw
+        self.redraw = true;
+        // Match message
+        match msg {
+            Msg::ConfigEditor(msg) => self.update_config_editor(msg),
+            Msg::DataBase(msg) => self.update_database_list(msg),
+
+            Msg::DeleteConfirm(msg) => self.update_delete_confirmation(msg),
+
+            Msg::ErrorPopup(msg) => self.update_error_popup_msg(&msg),
+            Msg::QuitPopup(msg) => self.update_quit_popup_msg(&msg),
+
+            Msg::Library(msg) => {
+                self.update_library(msg);
+            }
+            Msg::GeneralSearch(msg) => {
+                self.update_general_search(msg);
+            }
+            Msg::Playlist(msg) => {
+                self.update_playlist(msg);
+            }
+
+            Msg::Player(msg) => self.update_player(msg),
+
+            Msg::HelpPopup(msg) => self.update_help_popup_msg(&msg),
+            Msg::SortPopup(msg) => self.update_sort_popup_msg(msg),
+            Msg::YoutubeSearch(msg) => {
+                self.update_youtube_search(msg);
+            }
+            Msg::TagEditor(msg) => {
+                self.update_tageditor(msg);
+            }
+            Msg::UpdatePhoto => {
+                if let Err(e) = self.update_photo() {
+                    self.mount_error_popup(e.context("update_photo"));
+                }
+            }
+            Msg::Layout(msg) => self.update_layout(msg),
+
+            Msg::SavePlaylist(msg) => self.update_save_playlist(msg),
+
+            Msg::Podcast(msg) => self.update_podcast(msg),
+            Msg::LyricMessage(msg) => self.update_lyric_msg(msg),
+            Msg::Notification(msg) => self.update_notification_msg(msg),
+            Msg::Xywh(msg) => self.update_xywh_msg(msg),
+            Msg::ServerReqResponse(msg) => self.update_server_resp_msg(msg),
+            Msg::StreamUpdate(msg) => self.update_events_msg(msg),
+
+            Msg::ForceRedraw | Msg::ReloadTheme => (),
+        }
+    }
+}
+
+impl Model {
+    /// Ensure the `QuitPopup` always has the focus (top-most)
+    pub fn ensure_quit_popup_top_most_focus(&mut self) {
+        if self.app.mounted(&Id::QuitPopup)
+            && !self.app.focus().is_some_and(|v| *v == Id::QuitPopup)
+        {
+            self.app.active(&Id::QuitPopup).ok();
+        }
+    }
+
+    /// Handle all [`ErrorPopupMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_error_popup_msg(&mut self, msg: &ErrorPopupMsg) {
+        match msg {
+            ErrorPopupMsg::Close => {
+                let _ = self.umount_error_popup();
+            }
+        }
+    }
+
+    /// Handle all [`HelpPopupMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_help_popup_msg(&mut self, msg: &HelpPopupMsg) {
+        match msg {
+            HelpPopupMsg::Show => {
+                self.mount_help_popup()
+                    .expect("Expect HelpPopup to mount correctly");
+            }
+            HelpPopupMsg::Close => {
+                let _ = self.umount_help_popup();
+            }
+        }
+    }
+
+    /// Handle all [`SortPopupMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_sort_popup_msg(&mut self, msg: SortPopupMsg) {
+        match msg {
+            SortPopupMsg::Show => {
+                self.mount_sort_popup()
+                    .expect("Expect SortPopup to mount correctly");
+            }
+            SortPopupMsg::Close => {
+                let _ = self.umount_sort_popup();
+                self.update_photo().ok();
+            }
+            SortPopupMsg::Selected(criterion, direction) => {
+                let _ = self.umount_sort_popup();
+                self.playlist_sort(criterion, direction);
+                self.update_photo().ok();
+            }
+        }
+    }
+
+    /// Handle all [`QuitPopupMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_quit_popup_msg(&mut self, msg: &QuitPopupMsg) {
+        match msg {
+            QuitPopupMsg::Show => {
+                if self.config_tui.read().settings.behavior.confirm_quit {
+                    self.mount_quit_popup()
+                        .expect("Expect QuitPopup to unmount correctly");
+                } else {
+                    self.quit = true;
+                }
+            }
+            QuitPopupMsg::CloseCancel => {
+                let _ = self.umount_quit_popup();
+            }
+            QuitPopupMsg::CloseOk => {
+                self.quit = true;
+            }
+        }
+    }
+
+    /// Handle all [`XYWHMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_xywh_msg(&mut self, msg: XYWHMsg) {
+        match msg {
+            XYWHMsg::MoveLeft => self.xywh_move_left(),
+            XYWHMsg::MoveRight => self.xywh_move_right(),
+            XYWHMsg::MoveUp => self.xywh_move_up(),
+            XYWHMsg::MoveDown => self.xywh_move_down(),
+            XYWHMsg::ZoomIn => self.xywh_zoom_in(),
+            XYWHMsg::ZoomOut => self.xywh_zoom_out(),
+            XYWHMsg::ToggleHidden => {
+                self.xywh_toggle_hide();
+            }
+            XYWHMsg::CoverDLResult(msg) => match msg {
+                CoverDLResult::FetchPhotoSuccess(image_wrapper) => {
+                    self.show_image(&image_wrapper.data).ok();
+                }
+                CoverDLResult::FetchPhotoErr(err_text) => {
+                    self.show_message_timeout_label_help(err_text, None, None, None);
+                }
+            },
+        }
+    }
+
+    /// Handle all [`LyricMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_lyric_msg(&mut self, msg: LyricMsg) {
+        match msg {
+            LyricMsg::Cycle => {
+                self.lyric_cycle();
+            }
+            LyricMsg::AdjustDelay(offset) => {
+                self.lyric_adjust_delay(offset);
+            }
+            LyricMsg::TextAreaBlurUp => {
+                self.app.active(&Id::Playlist).ok();
+            }
+            LyricMsg::TextAreaBlurDown => {
+                match self.layout {
+                    TermusicLayout::TreeView => self.app.active(&Id::Library).ok(),
+                    TermusicLayout::DataBase => self.app.active(&Id::DBListCriteria).ok(),
+                    TermusicLayout::Podcast => self.app.active(&Id::Podcast).ok(),
+                };
+            }
+        }
+    }
+
+    /// Handle all [`NotificationMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_notification_msg(&mut self, msg: NotificationMsg) {
+        match msg {
+            NotificationMsg::MessageShow((title, text)) => {
+                self.mount_message(title.to_string(), text.to_string())
+                    .expect("Expect MessagePopup to mount correctly");
+            }
+            NotificationMsg::MessageHide((title, text)) => {
+                let _ = self.umount_message(&title, &text);
+            }
+        }
+    }
+
+    /// Handle all [`PCMsg`] messages. Sub-function for [`update`](Self::update).
+    #[allow(clippy::too_many_lines)]
+    fn update_podcast(&mut self, msg: PCMsg) {
+        match msg {
+            PCMsg::PodcastBlurDown => {
+                self.app.active(&Id::Episode).ok();
+            }
+            PCMsg::PodcastBlurUp => {
+                self.app.active(&Id::Lyric).ok();
+            }
+            PCMsg::EpisodeBlurDown => {
+                self.app.active(&Id::Playlist).ok();
+            }
+            PCMsg::EpisodeBlurUp => {
+                self.app.active(&Id::Podcast).ok();
+            }
+            PCMsg::PodcastAddPopupShow => {
+                self.mount_podcast_add_popup()
+                    .expect("Expected PodcastAddPopup to mount correctly");
+            }
+            PCMsg::PodcastAddPopupCloseOk(url) => {
+                let _ = self.umount_podcast_add_popup();
+
+                if url.starts_with("http") {
+                    self.podcast_add(url);
+                } else {
+                    self.podcast_search_itunes(&url);
+                    self.mount_podcast_search_table()
+                        .expect("Expect PodcastSearchTablePopup to mount correctly");
+                }
+            }
+            PCMsg::PodcastAddPopupCloseCancel => {
+                let _ = self.umount_podcast_add_popup();
+            }
+
+            PCMsg::SyncResult(msg) => self.podcast_handle_sync_result(msg),
+            PCMsg::DLResult(msg) => self.podcast_handle_dl_result(msg),
+
+            PCMsg::PodcastSelected(index) => {
+                self.podcast.podcasts_index = index;
+                if let Err(e) = self.podcast_sync_episodes() {
+                    self.mount_error_popup(e.context("podcast sync episodes"));
+                }
+            }
+            PCMsg::DescriptionUpdate => self.lyric_update(),
+            PCMsg::EpisodeAdd(index) => {
+                if let Err(e) = self.playlist_add_episode(index) {
+                    self.mount_error_popup(e.context("podcast playlist add episode"));
+                }
+            }
+            PCMsg::EpisodeMarkPlayed(index) => {
+                if let Err(e) = self.episode_mark_played(index) {
+                    self.mount_error_popup(e.context("podcast episode mark played"));
+                }
+            }
+            PCMsg::EpisodeMarkAllPlayed => {
+                if let Err(e) = self.episode_mark_all_played() {
+                    self.mount_error_popup(e.context("podcast episode mark all played"));
+                }
+            }
+            PCMsg::PodcastRefreshOne(index) => {
+                if let Err(e) = self.podcast_refresh_feeds(Some(index)) {
+                    self.mount_error_popup(e.context("podcast refresh feeds one"));
+                }
+            }
+            PCMsg::PodcastRefreshAll => {
+                if let Err(e) = self.podcast_refresh_feeds(None) {
+                    self.mount_error_popup(e.context("podcast refresh feeds all"));
+                }
+            }
+
+            PCMsg::EpisodeDownload(index) => {
+                if let Err(e) = self.episode_download(Some(index)) {
+                    self.mount_error_popup(e.context("podcast episode download"));
+                }
+            }
+
+            PCMsg::EpisodeDeleteFile(index) => {
+                if let Err(e) = self.episode_delete_file(index) {
+                    self.mount_error_popup(e.context("podcast episode delete"));
+                }
+            }
+            PCMsg::FeedDeleteShow => {
+                self.mount_feed_delete_confirm_radio()
+                    .expect("Expected FeedDeleteConfirmRadioPopup to mount correctly");
+            }
+            PCMsg::FeedDeleteCloseOk => {
+                let _ = self.umount_feed_delete_confirm_radio();
+                if let Err(e) = self.podcast_remove_feed() {
+                    self.mount_error_popup(e.context("podcast remove feed"));
+                }
+            }
+            PCMsg::FeedDeleteCloseCancel => {
+                let _ = self.umount_feed_delete_confirm_radio();
+            }
+            PCMsg::FeedsDeleteShow => {
+                self.mount_feed_delete_confirm_input()
+                    .expect("Expected FeedDeleteConfirmInputPopup to mount correctly");
+            }
+            PCMsg::FeedsDeleteCloseOk => {
+                let _ = self.umount_feed_delete_confirm_input();
+                if let Err(e) = self.podcast_remove_all_feeds() {
+                    self.mount_error_popup(e.context("podcast remove all feeds"));
+                }
+            }
+            PCMsg::FeedsDeleteCloseCancel => {
+                let _ = self.umount_feed_delete_confirm_input();
+            }
+            PCMsg::SearchItunesCloseCancel => {
+                let _ = self.umount_podcast_search_table();
+            }
+            PCMsg::SearchItunesCloseOk(index) => {
+                if let Some(vec) = &self.podcast.search_results
+                    && let Some(pod) = vec.get(index)
+                {
+                    self.podcast_add(pod.url.clone());
+                }
+            }
+            PCMsg::SearchSuccess(vec) => {
+                self.podcast.search_results = Some(vec.clone());
+                self.update_podcast_search_table();
+            }
+            PCMsg::SearchError(e) => self.mount_error_popup(anyhow!(e)),
+        }
+    }
+
+    /// Handle all cases for [`PodcastSyncResult`].
+    fn podcast_handle_sync_result(&mut self, msg: PodcastSyncResult) {
+        match msg {
+            PodcastSyncResult::FetchPodcastStart(url) => {
+                self.download_tracker.increase_one(url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_sync_start(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            PodcastSyncResult::SyncData((id, pod)) => {
+                self.download_tracker.decrease_one(&pod.url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_sync_success(),
+                    None,
+                    None,
+                    None,
+                );
+                if let Err(e) = self.add_or_sync_data(&pod, Some(id)) {
+                    self.mount_error_popup(e.context("add or sync data"));
+                }
+            }
+            PodcastSyncResult::NewData(pod) => {
+                self.download_tracker.decrease_one(&pod.url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_feeds_added(),
+                    None,
+                    None,
+                    None,
+                );
+                if let Err(e) = self.add_or_sync_data(&pod, None) {
+                    self.mount_error_popup(e.context("add or sync data"));
+                }
+            }
+            PodcastSyncResult::Error(feed) => {
+                self.download_tracker.decrease_one(&feed.url);
+                self.mount_error_popup(anyhow!("Error happened with feed: {:?}", feed.title));
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_feed_sync_failed(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Handle all cases for [`PodcastDLResult`].
+    fn podcast_handle_dl_result(&mut self, msg: PodcastDLResult) {
+        match msg {
+            PodcastDLResult::DLStart(ep_data) => {
+                self.download_tracker.increase_one(&ep_data.url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_download_start(&ep_data.title),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            PodcastDLResult::DLComplete(ep_data) => {
+                if let Err(e) = self.episode_download_complete(ep_data.clone()) {
+                    self.mount_error_popup(e.context("podcast episode download complete"));
+                }
+                self.download_tracker.decrease_one(&ep_data.url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_download_complete(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            PodcastDLResult::DLResponseError(ep_data) => {
+                self.download_tracker.decrease_one(&ep_data.url);
+                self.mount_error_popup(anyhow!("download failed for episode: {}", ep_data.title));
+                self.show_message_timeout_label_help(
+                    self.download_tracker
+                        .message_download_error_response(&ep_data.title),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            PodcastDLResult::DLFileCreateError(ep_data) => {
+                self.download_tracker.decrease_one(&ep_data.url);
+                self.mount_error_popup(anyhow!("download failed for episode: {}", ep_data.title));
+                self.show_message_timeout_label_help(
+                    self.download_tracker
+                        .message_download_error_file_create(&ep_data.title),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            PodcastDLResult::DLFileWriteError(ep_data) => {
+                self.download_tracker.decrease_one(&ep_data.url);
+                self.mount_error_popup(anyhow!("download failed for episode: {}", ep_data.title));
+                self.show_message_timeout_label_help(
+                    self.download_tracker
+                        .message_download_error_file_write(&ep_data.title),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Handle Player related messages & events
+    fn update_player(&mut self, msg: PlayerMsg) {
+        match msg {
+            PlayerMsg::TogglePause => {
+                self.player_toggle_pause();
+            }
+            PlayerMsg::RestartTrack => {
+                if self.is_radio() {
+                    self.show_message_timeout_label_help(
+                        "seek is not available for live radio",
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+                self.command(TuiCmd::RestartTrack);
+            }
+            PlayerMsg::SeekForward => {
+                if self.is_radio() {
+                    self.show_message_timeout_label_help(
+                        "seek is not available for live radio",
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+                self.command(TuiCmd::SeekForward);
+            }
+            PlayerMsg::SeekBackward => {
+                if self.is_radio() {
+                    self.show_message_timeout_label_help(
+                        "seek is not available for live radio",
+                        None,
+                        None,
+                        None,
+                    );
+                    return;
+                }
+                self.command(TuiCmd::SeekBackward);
+            }
+            PlayerMsg::SpeedUp => {
+                self.command(TuiCmd::SpeedUp);
+            }
+            PlayerMsg::SpeedDown => {
+                self.command(TuiCmd::SpeedDown);
+            }
+            PlayerMsg::VolumeUp => {
+                self.command(TuiCmd::VolumeUp);
+            }
+            PlayerMsg::VolumeDown => {
+                self.command(TuiCmd::VolumeDown);
+            }
+            PlayerMsg::ToggleGapless => {
+                self.command(TuiCmd::ToggleGapless);
+            }
+        }
+    }
+
+    /// Switch the main view / layout.
+    #[expect(clippy::too_many_lines)]
+    fn update_layout(&mut self, msg: MainLayoutMsg) {
+        match msg {
+            MainLayoutMsg::DataBase => {
+                let mut need_to_set_focus = true;
+                // TODO: deduplicate the focus checking
+                if let Some(true) = self
+                    .app
+                    .query(&Id::DBListCriteria, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if let Some(true) = self
+                    .app
+                    .query(&Id::DBListSearchResult, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+                if let Some(true) = self
+                    .app
+                    .query(&Id::DBListSearchTracks, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Playlist, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+                if need_to_set_focus {
+                    self.app.active(&Id::DBListCriteria).ok();
+                }
+
+                self.layout = TermusicLayout::DataBase;
+                self.playlist_switch_layout();
+                self.lyric_update_title();
+                self.lyric_update();
+            }
+            MainLayoutMsg::TreeView => {
+                let mut need_to_set_focus = true;
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Playlist, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Library, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if need_to_set_focus {
+                    self.app.active(&Id::Library).ok();
+                }
+
+                self.layout = TermusicLayout::TreeView;
+                self.playlist_switch_layout();
+                self.lyric_update_title();
+                self.lyric_update();
+            }
+            MainLayoutMsg::Podcast => {
+                let mut need_to_set_focus = true;
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Podcast, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Episode, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Playlist, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if let Some(true) = self
+                    .app
+                    .query(&Id::Lyric, Attribute::Focus)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(QueryResult::as_ref)
+                    .and_then(AttrValueRef::as_flag)
+                {
+                    need_to_set_focus = false;
+                }
+
+                if need_to_set_focus {
+                    self.app.active(&Id::Podcast).ok();
+                }
+
+                self.layout = TermusicLayout::Podcast;
+                self.podcast_sync_feeds_and_episodes();
+                self.playlist_switch_layout();
+                self.lyric_update_title();
+                self.lyric_update();
+            }
+        }
+    }
+
+    /// Handle all [`DBMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_database_list(&mut self, msg: DBMsg) {
+        match msg {
+            DBMsg::CriteriaBlurDown | DBMsg::SearchTracksBlurUp => {
+                self.app.active(&Id::DBListSearchResult).ok();
+            }
+            DBMsg::SearchResultBlurDown => {
+                self.app.active(&Id::DBListSearchTracks).ok();
+            }
+            DBMsg::SearchTracksBlurDown | DBMsg::CriteriaBlurUp => {
+                self.app.active(&Id::Playlist).ok();
+            }
+            DBMsg::SearchResultBlurUp => {
+                self.app.active(&Id::DBListCriteria).ok();
+            }
+            DBMsg::SearchResult(criteria) => {
+                self.dw.criteria = criteria;
+                self.database_update_search_results();
+            }
+            DBMsg::SearchTrack(index) => {
+                self.database_update_search_tracks(index);
+            }
+            DBMsg::AddPlaylist(index) => {
+                if !self.dw.search_tracks.is_empty()
+                    && let Some(track) = self.dw.search_tracks.get(index)
+                {
+                    let file = track.as_pathbuf();
+                    if let Err(e) = self.playlist_add(&file) {
+                        self.mount_error_popup(e.context("playlist add"));
+                    }
+                }
+            }
+            DBMsg::AddAllToPlaylist => {
+                let db_search_tracks = self.dw.search_tracks.clone();
+                self.playlist_add_all_from_db(&db_search_tracks);
+            }
+
+            DBMsg::AddResultToPlaylist(index) => {
+                if let Some(result) = self.dw.search_results.get(index).cloned()
+                    && let Some(result) =
+                        self.database_get_tracks_by_criteria(self.dw.criteria, &result)
+                {
+                    self.playlist_add_all_from_db(&result);
+                }
+            }
+            DBMsg::AddAllResultsToPlaylist => {
+                self.database_add_all_results();
+            }
+
+            DBMsg::AddAllResultsConfirmShow => {
+                // dont try showing the popup if there is nothing to add
+                if !self.dw.search_results.is_empty() {
+                    self.mount_results_add_confirm_database(self.dw.criteria)
+                        .expect("Expected ResultAddConfirmPopup to mount correctly");
+                }
+            }
+            DBMsg::AddAllResultsConfirmCancel => {
+                let _ = self.umount_results_add_confirm_database();
+            }
+        }
+    }
+
+    /// Handle all [`LIMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_library(&mut self, msg: LIMsg) {
+        match msg {
+            LIMsg::TreeBlur => {
+                assert!(self.app.active(&Id::Playlist).is_ok());
+            }
+            LIMsg::PasteError(err) => self.mount_error_popup(anyhow!(err)),
+            LIMsg::PlaylistRunDelete => self.playlist_update_library_delete(),
+            LIMsg::SwitchRoot(old_path) => self.new_library_switch_root(&old_path),
+            LIMsg::AddRoot(path) => {
+                if let Err(e) = self.new_library_add_root(path) {
+                    self.mount_error_popup(e.context("library add root"));
+                }
+            }
+            LIMsg::RemoveRoot(path) => {
+                if let Err(e) = self.new_library_remove_root(path) {
+                    self.mount_error_popup(e.context("library remove root"));
+                }
+            }
+
+            // handled by the component
+            LIMsg::Reload(_data) => (),
+            LIMsg::ReloadPath(_data) => (),
+            LIMsg::TreeNodeReady(_data) => (),
+            LIMsg::TreeNodeReadySub(_data) => (),
+            LIMsg::RequestCurrentPath(_data) => (),
+        }
+    }
+
+    /// Handle all [`YSMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_youtube_search(&mut self, msg: YSMsg) {
+        match msg {
+            YSMsg::InputPopupShow(current_node) => {
+                self.mount_youtube_search_input(current_node)
+                    .expect("Expect YoutubeSearchInputPopup to mount correctly");
+            }
+            YSMsg::InputPopupCloseCancel => {
+                let _ = self.umount_youtube_search_input();
+            }
+            YSMsg::InputPopupCloseOk(url, current_node) => {
+                let _ = self.umount_youtube_search_input();
+                if url.starts_with("http") {
+                    match self.youtube_dl(&url, &current_node) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.mount_error_popup(e.context("youtube-dl download"));
+                        }
+                    }
+                } else {
+                    self.mount_youtube_search_table(current_node)
+                        .expect("Expect YoutubeSearchTablePopup to mount correctly");
+                    self.youtube_options_search(url);
+                }
+            }
+            YSMsg::TablePopupCloseCancel => {
+                let _ = self.umount_youtube_search_table_popup();
+            }
+            YSMsg::ReqNextPage => {
+                self.youtube_options_next_page();
+            }
+            YSMsg::ReqPreviousPage => {
+                self.youtube_options_prev_page();
+            }
+            YSMsg::PageLoaded(data) => {
+                self.youtube_options.data = data;
+                self.sync_youtube_options();
+            }
+            YSMsg::PageLoadError(err) => {
+                self.mount_error_popup(anyhow!(err));
+            }
+
+            YSMsg::TablePopupCloseOk(index, current_node) => {
+                if let Err(e) = self.youtube_options_download(index, &current_node) {
+                    self.mount_error_popup(e.context("youtube-dl options download"));
+                }
+            }
+            YSMsg::YoutubeSearchSuccess(youtube_options) => {
+                self.youtube_options = youtube_options;
+                self.sync_youtube_options();
+                self.redraw = true;
+            }
+            YSMsg::YoutubeSearchFail(e) => {
+                self.redraw = true;
+                self.mount_error_popup(anyhow!("Youtube search fail: {e}"));
+            }
+            YSMsg::Download(msg) => self.update_ys_download_msg(msg),
+        }
+    }
+
+    /// Handle all [`YSMsg`] messages. Sub-function for [`update_youtube_search`](Self::update_youtube_search).
+    fn update_ys_download_msg(&mut self, msg: YTDLMsg) {
+        match msg {
+            YTDLMsg::Start(url, title) => {
+                self.download_tracker.increase_one(&*url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_download_start(&title),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            YTDLMsg::Success(url) => {
+                self.download_tracker.decrease_one(&url);
+                self.show_message_timeout_label_help(
+                    self.download_tracker.message_download_complete(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            YTDLMsg::Completed(_url, file) => {
+                if let Some(path_str) = file {
+                    self.new_library_reload_and_focus(PathBuf::from(path_str));
+                }
+            }
+            YTDLMsg::Err(url, title, error_message) => {
+                self.download_tracker.decrease_one(&url);
+                self.mount_error_popup(anyhow!("download failed: {error_message}"));
+                self.show_message_timeout_label_help(
+                    self.download_tracker
+                        .message_download_error_response(&title),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Handle all [`GSMsg`] messages. Sub-function for [`update`](Self::update).
+    #[allow(clippy::too_many_lines)]
+    fn update_general_search(&mut self, msg: GSMsg) {
+        match msg {
+            GSMsg::PopupShowDatabase => {
+                self.mount_search_database();
+                self.database_update_search("*");
+            }
+            GSMsg::PopupShowLibrary(path) => {
+                self.mount_search_library(path.clone());
+                self.new_library_update_search("*", &path);
+            }
+            GSMsg::PopupShowPlaylist => {
+                // TODO: best option would be to have the search work on the IDs (paths, urls) while it is loading and also later at lower weight
+                self.mount_search_loading_playlist_data()
+                    .expect("Expected Search Data Loading Popup to mount correctly");
+            }
+            GSMsg::CloseLoading => {
+                self.umount_search_loading_playlist_data()
+                    .expect("Unmount Search Data Loading Popup");
+            }
+            GSMsg::PlaylistDataReady(data) => {
+                self.playback.set_search_cached_tracks(Some(data));
+                self.umount_search_loading_playlist_data()
+                    .expect("Unmount Search Data Loading Popup");
+
+                self.mount_search_playlist();
+                self.playlist_update_search("*");
+            }
+            GSMsg::PopupShowEpisode => {
+                self.mount_search_episode();
+                self.podcast_update_search_episode("*");
+            }
+
+            GSMsg::PopupShowPodcast => {
+                self.mount_search_podcast();
+                self.podcast_update_search_podcast("*");
+            }
+            GSMsg::PopupUpdateLibrary(input, path) => self.new_library_update_search(&input, &path),
+
+            GSMsg::PopupUpdatePlaylist(input) => self.playlist_update_search(&input),
+
+            GSMsg::PopupUpdateDatabase(input) => self.database_update_search(&input),
+
+            GSMsg::InputBlur => {
+                if self.app.mounted(&Id::GeneralSearchTable) {
+                    self.app.active(&Id::GeneralSearchTable).ok();
+                }
+            }
+            GSMsg::TableBlur => {
+                if self.app.mounted(&Id::GeneralSearchInput) {
+                    self.app.active(&Id::GeneralSearchInput).ok();
+                }
+            }
+            GSMsg::PopupCloseCancel => {
+                let _ = self.umount_general_search();
+            }
+
+            GSMsg::PopupCloseLibraryAddPlaylist => {
+                if let Err(e) = self.general_search_after_library_add_playlist() {
+                    self.mount_error_popup(e.context("general search"));
+                }
+            }
+            GSMsg::PopupCloseOkLibraryLocate => {
+                self.general_search_after_library_select();
+                let _ = self.umount_general_search();
+            }
+            GSMsg::PopupClosePlaylistPlaySelected => {
+                self.general_search_after_playlist_play_selected();
+                let _ = self.umount_general_search();
+            }
+            GSMsg::PopupCloseOkPlaylistLocate => {
+                self.general_search_after_playlist_select();
+                let _ = self.umount_general_search();
+            }
+            GSMsg::PopupCloseDatabaseAddPlaylist => {
+                if let Err(e) = self.general_search_after_database_add_playlist() {
+                    self.mount_error_popup(e.context("add to playlist from database search"));
+                }
+            }
+            GSMsg::PopupCloseEpisodeAddPlaylist => {
+                if let Err(e) = self.general_search_after_episode_add_playlist() {
+                    self.mount_error_popup(e.context("add to playlist from episode search"));
+                }
+            }
+            GSMsg::PopupCloseOkEpisodeLocate => {
+                if let Err(e) = self.general_search_after_episode_select() {
+                    self.mount_error_popup(e.context("general search after episode select"));
+                }
+                self.podcast_focus_episode_list();
+                let _ = self.umount_general_search();
+            }
+
+            GSMsg::PopupUpdateEpisode(input) => self.podcast_update_search_episode(&input),
+            GSMsg::PopupUpdatePodcast(input) => self.podcast_update_search_podcast(&input),
+            GSMsg::PopupCloseOkPodcastLocate => {
+                if let Err(e) = self.general_search_after_podcast_select() {
+                    self.mount_error_popup(e.context("general search after podcast select"));
+                }
+                self.podcast_focus_podcast_list();
+                let _ = self.umount_general_search();
+            }
+        }
+    }
+
+    /// Handle all [`DeleteConfirmMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_delete_confirmation(&mut self, msg: DeleteConfirmMsg) {
+        match msg {
+            DeleteConfirmMsg::Show(path, focus_node) => {
+                self.new_library_show_delete_confirm(path, focus_node)
+                    .expect("Expect DeleteConfirm to mount correctly");
+            }
+            DeleteConfirmMsg::CloseCancel => {
+                let _ = self.umount_confirm_radio();
+                let _ = self.umount_confirm_input();
+            }
+            DeleteConfirmMsg::CloseOk(path, focus_node) => {
+                let _ = self.umount_confirm_radio();
+                let _ = self.umount_confirm_input();
+                if let Err(e) = self.new_library_delete_node(&path, focus_node) {
+                    self.mount_error_popup(e.context("library delete song"));
+                }
+            }
+        }
+    }
+
+    /// Handle all [`PLMsg`] messages. Sub-function for [`update`](Self::update).
+    fn update_playlist(&mut self, msg: PLMsg) {
+        match msg {
+            PLMsg::Add(current_node) => {
+                if let Err(e) = self.playlist_add(&current_node) {
+                    self.mount_error_popup(e.context("playlist add"));
+                }
+            }
+            PLMsg::Delete(index) => {
+                self.playlist_delete_item(index);
+            }
+            PLMsg::DeleteAll => {
+                self.playlist_clear();
+            }
+            PLMsg::Shuffle => {
+                self.playlist_shuffle();
+            }
+            PLMsg::PlaySelected(index) => {
+                self.playlist_play_selected(index);
+            }
+            PLMsg::LoopModeCycle => {
+                self.command(TuiCmd::CycleLoop);
+            }
+            PLMsg::PlaylistTableBlurDown => match self.layout {
+                TermusicLayout::TreeView => assert!(self.app.active(&Id::Library).is_ok()),
+                TermusicLayout::DataBase => assert!(self.app.active(&Id::DBListCriteria).is_ok()),
+                TermusicLayout::Podcast => assert!(self.app.active(&Id::Lyric).is_ok()),
+            },
+            PLMsg::NextSong => {
+                self.command(TuiCmd::SkipNext);
+            }
+
+            PLMsg::PrevSong => {
+                self.player_previous();
+            }
+            PLMsg::SwapDown(index) => {
+                self.playlist_swap_down(index);
+            }
+            PLMsg::SwapUp(index) => {
+                self.playlist_swap_up(index);
+            }
+            PLMsg::AddRandomAlbum => {
+                self.playlist_add_random_album();
+            }
+            PLMsg::AddRandomTracks => {
+                self.playlist_add_random_tracks();
+            }
+            PLMsg::PlaylistTableBlurUp => match self.layout {
+                TermusicLayout::TreeView => assert!(self.app.active(&Id::Library).is_ok()),
+                TermusicLayout::DataBase => {
+                    assert!(self.app.active(&Id::DBListSearchTracks).is_ok());
+                }
+                TermusicLayout::Podcast => assert!(self.app.active(&Id::Episode).is_ok()),
+            },
+
+            PLMsg::TrackNotify(track) => {
+                if self.playback.handle_loaded_current_track(track) {
+                    self.lyric_update_title();
+                    // we dont care if the message was not loaded anymore.
+                    let _ = self.umount_message(Self::CURRENTLY_PLAYING_TXT, Self::LOADING_TXT);
+                    self.update_playing_song();
+                    if let Err(err) = self.update_photo() {
+                        error!("Updating photo failed: {err:#?}");
+                    }
+                }
+            }
+        }
+    }
+
+    const CURRENTLY_PLAYING_TXT: &str = "Currently Playing";
+    const LOADING_TXT: &str = "Loading...";
+
+    // show a popup for playing song
+    pub fn update_playing_song(&mut self) {
+        if let Some(track) = self.playback.current_track() {
+            // Updated from "Loading..." by calling the function again when data is ready. (and unsetting the old value beforehand)
+            let track = track.as_track();
+            if self.layout == TermusicLayout::Podcast {
+                let title = track.map_or(Self::LOADING_TXT, |track| {
+                    track.title().unwrap_or("Unknown Episode")
+                });
+                self.update_show_message_timeout(Self::CURRENTLY_PLAYING_TXT, title, None);
+                return;
+            }
+            let name = track.map_or(Self::LOADING_TXT.into(), |track| {
+                track.title().map_or_else(|| track.id_str(), Into::into)
+            });
+            self.update_show_message_timeout(Self::CURRENTLY_PLAYING_TXT, name, None);
+
+            self.playlist_sync();
+        }
+    }
+
+    pub fn update_layout_for_current_track(&mut self) {
+        if let Some(track) = self.playback.current_track() {
+            match track.media_type() {
+                MediaTypesSimple::Podcast => {
+                    if self.layout == TermusicLayout::Podcast {
+                        return;
+                    }
+                    self.update_layout(MainLayoutMsg::Podcast);
+                }
+                MediaTypesSimple::Music | MediaTypesSimple::LiveRadio => match self.layout {
+                    TermusicLayout::TreeView | TermusicLayout::DataBase => {}
+                    TermusicLayout::Podcast => {
+                        self.update_layout(MainLayoutMsg::TreeView);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Handle & update [`SavePlaylistMsg`] related components.
+    fn update_save_playlist(&mut self, msg: SavePlaylistMsg) {
+        match msg {
+            SavePlaylistMsg::Show(path) => {
+                if let Err(e) = self.mount_save_playlist(&path) {
+                    self.mount_error_popup(e.context("mount save playlist"));
+                }
+            }
+            SavePlaylistMsg::CloseCancel => {
+                let _ = self.umount_save_playlist();
+            }
+            SavePlaylistMsg::CloseOk(full_path) => {
+                let _ = self.umount_save_playlist();
+                if let Err(e) = self.playlist_save_m3u_before(full_path) {
+                    self.mount_error_popup(e.context("save m3u playlist before"));
+                }
+            }
+            SavePlaylistMsg::OverwriteCancel => {
+                let _ = self.umount_save_playlist_confirm();
+            }
+            SavePlaylistMsg::OverwriteOk(filename) => {
+                if let Err(e) = self.playlist_save_m3u(filename) {
+                    self.mount_error_popup(e.context("save m3u playlist"));
+                }
+                let _ = self.umount_save_playlist_confirm();
+            }
+
+            // handled by the component
+            SavePlaylistMsg::Update(_filename) => (),
+        }
+    }
+
+    /// Handle all [`ServerReqResponse`].
+    fn update_server_resp_msg(&mut self, msg: ServerReqResponse) {
+        match msg {
+            ServerReqResponse::GetProgress(response) => {
+                let pprogress: PlayerProgress = response.progress.unwrap_or_default().into();
+                self.progress_update(
+                    pprogress.position,
+                    pprogress.total_duration.unwrap_or_default(),
+                );
+
+                self.config_server.write().settings.player.volume = clamp_u16(response.volume);
+
+                self.lyric_update_for_radio(response.radio_title);
+
+                self.playback
+                    .set_status(RunningStatus::from_u32(response.status));
+                // "GetProgress" is, as of ~termusic 0.11.0~0.12.0, only called initially or having missed events, so everything should be reloaded.
+                self.player_update_current_track_after();
+            }
+            ServerReqResponse::FullPlaylist(playlist_tracks) => {
+                info!("Processing Playlist from server");
+                let current_track_index = playlist_tracks.current_track_index;
+                if let Err(err) = self.playback.load_from_grpc(playlist_tracks) {
+                    self.mount_error_popup(err);
+                }
+
+                self.playlist_sync();
+
+                self.handle_current_track_index(
+                    usize::try_from(current_track_index).unwrap(),
+                    true,
+                );
+            }
+        }
+    }
+
+    /// Handle Stream updates [`UpdateEvents`].
+    ///
+    /// In case of lag, sends a [`TuiCmd::GetProgress`].
+    fn update_events_msg(&mut self, msg: UpdateEvents) {
+        match msg {
+            UpdateEvents::MissedEvents { amount } => {
+                warn!("Stream Lagged, missed events: {amount}");
+                // we know that we missed events, force to get full information from GetProgress endpoint
+                self.command(TuiCmd::GetProgress);
+            }
+            UpdateEvents::VolumeChanged { volume } => {
+                self.config_server.write().settings.player.volume = volume;
+                self.progress_update_title();
+            }
+            UpdateEvents::SpeedChanged { speed } => {
+                self.config_server.write().settings.player.speed = speed;
+                self.progress_update_title();
+            }
+            UpdateEvents::PlayStateChanged { playing } => {
+                self.playback.set_status(RunningStatus::from_u32(playing));
+
+                // there is no special event for "no more tracks" or "track EOF", so we have to
+                // handle "no more tracks / stopped" in this
+                if self.playback.is_stopped() {
+                    self.playback.clear_current_track();
+                    self.lyric_update();
+                    self.progress_update(Some(Duration::ZERO), Duration::ZERO);
+                }
+
+                self.progress_update_title();
+                self.lyric_update_title();
+            }
+            UpdateEvents::TrackChanged(track_changed_info) => {
+                if let Some(progress) = track_changed_info.progress {
+                    self.progress_update(
+                        progress.position,
+                        progress.total_duration.unwrap_or_default(),
+                    );
+                }
+
+                self.handle_current_track_index(
+                    usize::try_from(track_changed_info.current_track_index).unwrap(),
+                    false,
+                );
+
+                if let Some(title) = track_changed_info.title {
+                    self.lyric_update_for_radio(title);
+                } else {
+                    // fallback in case no title is immediately available on radio start.
+                    // matching that the current track is actually radio, is in the function itself.
+                    self.lyric_update_for_radio("");
+                }
+            }
+            UpdateEvents::GaplessChanged { gapless } => {
+                self.config_server.write().settings.player.gapless = gapless;
+                self.progress_update_title();
+            }
+            UpdateEvents::Progress(progress) => {
+                self.progress_update(
+                    progress.position,
+                    progress.total_duration.unwrap_or_default(),
+                );
+            }
+            UpdateEvents::PlaylistChanged(ev) => {
+                if let Err(err) = self.update_update_events_playlist_msg(ev) {
+                    self.mount_error_popup(err);
+                }
+            }
+        }
+    }
+
+    /// Handle Playlist Update Events [`UpdatePlaylistEvents`].
+    fn update_update_events_playlist_msg(&mut self, msg: UpdatePlaylistEvents) -> Result<()> {
+        match msg {
+            UpdatePlaylistEvents::PlaylistAddTrack(playlist_add_track) => {
+                self.handle_playlist_add(playlist_add_track)?;
+            }
+            UpdatePlaylistEvents::PlaylistRemoveTrack(playlist_remove_track) => {
+                self.handle_playlist_remove(&playlist_remove_track)?;
+            }
+            UpdatePlaylistEvents::PlaylistCleared => {
+                self.handle_playlist_clear();
+            }
+            UpdatePlaylistEvents::PlaylistLoopMode(loop_mode) => {
+                self.handle_playlist_loopmode(&loop_mode)?;
+            }
+            UpdatePlaylistEvents::PlaylistSwapTracks(swapped_tracks) => {
+                self.handle_playlist_swap_tracks(&swapped_tracks)?;
+            }
+            UpdatePlaylistEvents::PlaylistShuffled(shuffled) => {
+                self.handle_playlist_shuffled(shuffled)?;
+            }
+        }
+
+        Ok(())
+    }
+}

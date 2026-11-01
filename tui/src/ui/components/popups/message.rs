@@ -1,0 +1,162 @@
+use std::time::Duration;
+
+use anyhow::Result;
+use termusiclib::config::{SharedTuiSettings, v2::tui::theme::styles::ColorTermusic};
+use tokio::runtime::Handle;
+use tui_realm_stdlib::components::Paragraph;
+use tuirealm::{
+    component::{AppComponent, Component},
+    event::Event,
+    props::{
+        AttrValueRef, Attribute, BorderType, Borders, HorizontalAlignment, QueryResult,
+        TextModifiers, TextStatic, Title,
+    },
+    subscription::{EventClause, Sub, SubClause},
+};
+
+use crate::ui::model::{Model, UserEvent};
+use crate::ui::msg::Msg;
+use crate::ui::{
+    ids::Id,
+    msg::{NotificationMsg, SharedStaticStr},
+};
+
+#[derive(Component)]
+pub struct MessagePopup {
+    component: Paragraph,
+    config: SharedTuiSettings,
+}
+
+impl MessagePopup {
+    /// Apply theme-derived styling onto a Paragraph instance, in place.
+    ///
+    /// Shared by `new` (fresh component) and `refresh_theme` (re-styling an
+    /// already-mounted component) so the two can never drift out of sync.
+    fn apply_theme_style(comp: Paragraph, config: &SharedTuiSettings) -> Paragraph {
+        let config_tui = config.read_recursive();
+
+        comp.borders(
+            Borders::default()
+                .color(
+                    config_tui
+                        .settings
+                        .theme
+                        .get_color_from_theme(ColorTermusic::Cyan),
+                )
+                .modifiers(BorderType::Rounded),
+        )
+        .foreground(
+            config_tui
+                .settings
+                .theme
+                .get_color_from_theme(ColorTermusic::Green),
+        )
+        .background(config_tui.settings.theme.library_background())
+    }
+
+    pub fn new<T: Into<Title>, V: Into<TextStatic>>(
+        config: &SharedTuiSettings,
+        title: T,
+        msg: V,
+    ) -> Self {
+        let component = Self::apply_theme_style(Paragraph::default(), config)
+            .modifiers(TextModifiers::BOLD)
+            .alignment_horizontal(HorizontalAlignment::Center)
+            .title(title.into().alignment(HorizontalAlignment::Center))
+            .text(msg.into());
+
+        Self {
+            component,
+            config: config.clone(),
+        }
+    }
+
+    /// Re-apply the current theme's colors to this already-mounted popup, without
+    /// touching its currently displayed title / text.
+    fn refresh_theme(&mut self) {
+        let moved = std::mem::take(&mut self.component);
+        self.component = Self::apply_theme_style(moved, &self.config);
+    }
+}
+
+/// Get all subscriptions for the [`MessagePopup`] Component.
+fn message_subs() -> Vec<Sub<Id, UserEvent>> {
+    vec![Sub::new(
+        EventClause::User(UserEvent::Forward(Msg::ReloadTheme)),
+        SubClause::Always,
+    )]
+}
+
+impl AppComponent<Msg, UserEvent> for MessagePopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        if matches!(ev, Event::User(UserEvent::Forward(Msg::ReloadTheme))) {
+            self.refresh_theme();
+            return Some(Msg::ForceRedraw);
+        }
+
+        None
+    }
+}
+
+impl Model {
+    /// Mount a message / notification, for example for current track information.
+    pub fn mount_message<T: Into<Title>, V: Into<TextStatic>>(
+        &mut self,
+        title: T,
+        text: V,
+    ) -> Result<()> {
+        self.app.remount(
+            Id::MessagePopup,
+            Box::new(MessagePopup::new(&self.config_tui, title, text)),
+            message_subs(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Umount the Message component
+    pub fn umount_message(&mut self, _title: &str, text: &str) -> Result<()> {
+        if let Some(spans) = self
+            .app
+            .query(&Id::MessagePopup, Attribute::Text)
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(QueryResult::as_ref)
+            .and_then(AttrValueRef::as_text)
+            && let Some(display_text) = spans.iter().next()
+            && text.eq(&display_text.to_string())
+        {
+            self.app.umount(&Id::MessagePopup)?;
+        }
+
+        Ok(())
+    }
+
+    /// Show a message with a `title` and `text`, and hide it again after `time_out` or 10 seconds.
+    ///
+    /// This function requires to run in a tokio context.
+    pub fn update_show_message_timeout<TI, TE>(&self, title: TI, text: TE, time_out: Option<u64>)
+    where
+        TE: Into<SharedStaticStr>,
+        TI: Into<SharedStaticStr>,
+    {
+        let title = title.into();
+        let text = text.into();
+        let tx = self.tx_to_main.clone();
+        let delay = time_out.unwrap_or(10);
+
+        Handle::current().spawn(async move {
+            let _ = tx.send(Msg::Notification(NotificationMsg::MessageShow((
+                title.clone(),
+                text.clone(),
+            ))));
+
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+
+            let _ = tx.send(Msg::Notification(NotificationMsg::MessageHide((
+                title, text,
+            ))));
+        });
+    }
+}

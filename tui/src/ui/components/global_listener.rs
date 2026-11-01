@@ -1,0 +1,410 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use termusiclib::config::SharedTuiSettings;
+use termusiclib::config::v2::tui::keys::Keys;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tui_realm_stdlib::components::Phantom;
+use tuirealm::component::{AppComponent, Component};
+use tuirealm::event::Event;
+use tuirealm::subscription::{EventClause, Sub, SubClause};
+
+use crate::ui::Model;
+use crate::ui::ids::{Id, IdConfigEditor, IdTagEditor};
+use crate::ui::model::{TxToMain, UserEvent};
+use crate::ui::msg::{
+    ConfigEditorMsg, HelpPopupMsg, LIMsg, LIReqNode, LyricMsg, MainLayoutMsg, Msg, PLMsg,
+    PlayerMsg, QuitPopupMsg, SavePlaylistMsg, XYWHMsg,
+};
+
+#[derive(Component)]
+pub struct GlobalListener {
+    component: Phantom,
+    config: SharedTuiSettings,
+    tx_to_main: TxToMain,
+}
+
+impl GlobalListener {
+    pub fn new(config: SharedTuiSettings, tx_to_main: TxToMain) -> Self {
+        Self {
+            component: Phantom::default(),
+            config,
+            tx_to_main,
+        }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for GlobalListener {
+    #[allow(clippy::too_many_lines)]
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        let keys = &self.config.read().settings.keys;
+        match ev {
+            Event::WindowResize(..) => Some(Msg::UpdatePhoto),
+            // "escape" should always just close the dialogs or similar, but should never quit so escape can be "spammed" to exit everything
+            // Event::Keyboard(keyevent) if keyevent == keys.escape.get() => Some(Msg::QuitPopupShow),
+            Event::Keyboard(keyevent) if keyevent == keys.quit.get() => {
+                Some(Msg::QuitPopup(QuitPopupMsg::Show))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.toggle_pause.get() => {
+                Some(Msg::Player(PlayerMsg::TogglePause))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.next_track.get() => {
+                Some(Msg::Playlist(PLMsg::NextSong))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.previous_track.get() => {
+                Some(Msg::Playlist(PLMsg::PrevSong))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.volume_down.get() => {
+                Some(Msg::Player(PlayerMsg::VolumeDown))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.volume_up.get() => {
+                Some(Msg::Player(PlayerMsg::VolumeUp))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.select_view_keys.open_help.get() => {
+                Some(Msg::HelpPopup(HelpPopupMsg::Show))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.restart_track.get() => {
+                Some(Msg::Player(PlayerMsg::RestartTrack))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.seek_forward.get() => {
+                Some(Msg::Player(PlayerMsg::SeekForward))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.seek_backward.get() => {
+                Some(Msg::Player(PlayerMsg::SeekBackward))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.speed_up.get() => {
+                Some(Msg::Player(PlayerMsg::SpeedUp))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.speed_down.get() => {
+                Some(Msg::Player(PlayerMsg::SpeedDown))
+            }
+
+            Event::Keyboard(keyevent)
+                if keyevent == keys.lyric_keys.adjust_offset_forwards.get() =>
+            {
+                Some(Msg::LyricMessage(LyricMsg::AdjustDelay(1000)))
+            }
+            Event::Keyboard(keyevent)
+                if keyevent == keys.lyric_keys.adjust_offset_backwards.get() =>
+            {
+                Some(Msg::LyricMessage(LyricMsg::AdjustDelay(-1000)))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.lyric_keys.cycle_frames.get() => {
+                Some(Msg::LyricMessage(LyricMsg::Cycle))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.select_view_keys.view_library.get() => {
+                Some(Msg::Layout(MainLayoutMsg::TreeView))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.select_view_keys.view_database.get() => {
+                Some(Msg::Layout(MainLayoutMsg::DataBase))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.select_view_keys.view_podcasts.get() => {
+                Some(Msg::Layout(MainLayoutMsg::Podcast))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.toggle_prefetch.get() => {
+                Some(Msg::Player(PlayerMsg::ToggleGapless))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.select_view_keys.open_config.get() => {
+                Some(Msg::ConfigEditor(ConfigEditorMsg::Open))
+            }
+
+            Event::Keyboard(keyevent) if keyevent == keys.player_keys.save_playlist.get() => {
+                let (tx, mut rx) = mpsc::channel(1);
+                let tx_to_main = self.tx_to_main.clone();
+                Handle::current().spawn(async move {
+                    let value = rx.recv().await.flatten();
+                    match value {
+                        Some(value) => {
+                            let _ = tx_to_main.send(Msg::SavePlaylist(SavePlaylistMsg::Show(value)));
+                        },
+                        None => debug!("Current node request for Save Playlist canceled, no current node selected"),
+                    }
+                });
+
+                // We cannot just pass the message as a return from this, as that will just provide the message to "Model::update"
+                // and not to any component subscriptions, but it *is* when we send it to a port.
+                let _ = self
+                    .tx_to_main
+                    .send(Msg::Library(LIMsg::RequestCurrentPath(LIReqNode {
+                        sender: tx,
+                    })));
+
+                None
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.move_cover_art_keys.move_left.get() => {
+                Some(Msg::Xywh(XYWHMsg::MoveLeft))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.move_cover_art_keys.move_right.get() => {
+                Some(Msg::Xywh(XYWHMsg::MoveRight))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.move_cover_art_keys.move_up.get() => {
+                Some(Msg::Xywh(XYWHMsg::MoveUp))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.move_cover_art_keys.move_down.get() => {
+                Some(Msg::Xywh(XYWHMsg::MoveDown))
+            }
+            Event::Keyboard(keyevent)
+                if keyevent == keys.move_cover_art_keys.increase_size.get() =>
+            {
+                Some(Msg::Xywh(XYWHMsg::ZoomIn))
+            }
+            Event::Keyboard(keyevent)
+                if keyevent == keys.move_cover_art_keys.decrease_size.get() =>
+            {
+                Some(Msg::Xywh(XYWHMsg::ZoomOut))
+            }
+            Event::Keyboard(keyevent) if keyevent == keys.move_cover_art_keys.toggle_hide.get() => {
+                Some(Msg::Xywh(XYWHMsg::ToggleHidden))
+            }
+
+            // just forward the message to "Update" as there is no way to bypass this component forwarding
+            Event::User(UserEvent::Forward(msg)) => Some(msg.clone()),
+
+            _ => None,
+        }
+    }
+}
+
+impl Model {
+    // Mount global hotkey listener.
+    #[inline]
+    pub fn remount_global_listener(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::GlobalListener,
+            Box::new(GlobalListener::new(
+                self.config_tui.clone(),
+                self.tx_to_main.clone(),
+            )),
+            global_listener_subscriptions(&self.config_tui.read().settings.keys),
+        )?;
+
+        Ok(())
+    }
+}
+
+/// global listener subscriptions
+#[allow(clippy::too_many_lines)]
+fn global_listener_subscriptions(keys: &Keys) -> Vec<Sub<Id, UserEvent>> {
+    let no_popup_clause = Arc::new(no_popup_mounted_clause());
+
+    vec![
+        // Sub::new(
+        //     EventClause::Keyboard(keys.escape.get_owned()),
+        //     no_popup_clause.clone(),
+        // ),
+        Sub::new(
+            EventClause::Keyboard(keys.quit.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.toggle_pause.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.next_track.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.previous_track.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.speed_up.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.speed_down.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.volume_down.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        // Sub::new(
+        //     EventClause::Keyboard(keys.player_keys.volume_minus_2.get_owned()),
+        //     no_popup_clause.clone(),
+        // ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.volume_up.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        // Sub::new(
+        //     EventClause::Keyboard(keys.player_keys.volume_plus_2.get_owned()),
+        //     no_popup_clause.clone(),
+        // ),
+        Sub::new(
+            EventClause::Keyboard(keys.select_view_keys.open_help.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.restart_track.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.seek_forward.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.seek_backward.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.lyric_keys.adjust_offset_forwards.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.lyric_keys.adjust_offset_backwards.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.lyric_keys.cycle_frames.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.select_view_keys.view_library.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.select_view_keys.view_database.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.toggle_prefetch.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.select_view_keys.open_config.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.player_keys.save_playlist.get_owned()),
+            no_popup_clause.clone(),
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.select_view_keys.view_podcasts.get_owned()),
+            no_popup_clause,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.move_left.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.move_right.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.move_up.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.move_down.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.increase_size.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.decrease_size.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(
+            EventClause::Keyboard(keys.move_cover_art_keys.toggle_hide.get_owned()),
+            SubClause::Always,
+        ),
+        Sub::new(EventClause::WindowResize, SubClause::Always),
+        Sub::new(
+            // note that it does not matter what actual message is inside this "Forward" as "Discriminat" only compares "UserEvent" enum discriminants, not values
+            EventClause::Discriminant(UserEvent::Forward(Msg::ForceRedraw)),
+            SubClause::Always,
+        ),
+    ]
+}
+
+/// Generate the Clause for any popups to not be mounted.
+fn no_popup_mounted_clause() -> SubClause<Id> {
+    let mut collection = Vec::new();
+
+    podcast_popups(&mut collection);
+    general_popups(&mut collection);
+
+    // dont leave much unused space, as this vec will basically stay for the entire duration of the app
+    collection.shrink_to_fit();
+
+    SubClause::Not(Box::new(SubClause::OrMany(collection)))
+}
+
+/// Podcast related popups.
+///
+/// The values added to `storage` are meant to be used in a [`SubClause::OrMany`].
+#[inline]
+fn podcast_popups(storage: &mut Vec<SubClause<Id>>) {
+    storage.extend([
+        SubClause::IsMounted(Id::FeedDeleteConfirmRadioPopup),
+        SubClause::IsMounted(Id::FeedDeleteConfirmInputPopup),
+        SubClause::IsMounted(Id::PodcastSearchTablePopup),
+        SubClause::IsMounted(Id::PodcastAddPopup),
+    ]);
+}
+
+/// Popups that dont relate to any other place specifically.
+///
+/// The values added to `storage` are meant to be used in a [`SubClause::OrMany`].
+#[inline]
+fn general_popups(storage: &mut Vec<SubClause<Id>>) {
+    storage.extend(everywhere_popups());
+    storage.extend(delete_confirm_popups());
+    storage.extend(youtube_search_popups());
+
+    storage.extend([
+        SubClause::IsMounted(Id::GeneralSearchInput),
+        SubClause::IsMounted(Id::TagEditor(IdTagEditor::LabelHint)),
+        SubClause::IsMounted(Id::ConfigEditor(IdConfigEditor::Footer)),
+        SubClause::IsMounted(Id::SavePlaylistPopup),
+        SubClause::IsMounted(Id::SavePlaylistConfirm),
+        SubClause::IsMounted(Id::DatabaseAddConfirmPopup),
+        SubClause::IsMounted(Id::GeneralSearchDataLoading),
+    ]);
+}
+
+/// Youtube search popups, see [youtube search](super::popups::youtube_search).
+///
+/// The values returned are meant to be used in a [`SubClause::OrMany`].
+#[inline]
+fn youtube_search_popups() -> [SubClause<Id>; 3] {
+    [
+        SubClause::IsMounted(Id::YoutubeSearchInputPopup),
+        SubClause::IsMounted(Id::YoutubeSearchTablePopup),
+        SubClause::IsMounted(Id::YoutubeSearchTablePopup),
+    ]
+}
+
+/// Delete confirmation popups, anything from the `deleteconfirm` module.
+///
+/// The values returned are meant to be used in a [`SubClause::OrMany`].
+#[inline]
+fn delete_confirm_popups() -> [SubClause<Id>; 2] {
+    [
+        SubClause::IsMounted(Id::DeleteConfirmInputPopup),
+        SubClause::IsMounted(Id::DeleteConfirmRadioPopup),
+    ]
+}
+
+/// Popups that could happen everywhere.
+///
+/// The values returned are meant to be used in a [`SubClause::OrMany`].
+#[inline]
+fn everywhere_popups() -> [SubClause<Id>; 4] {
+    [
+        SubClause::IsMounted(Id::HelpPopup),
+        SubClause::IsMounted(Id::ErrorPopup),
+        SubClause::IsMounted(Id::QuitPopup),
+        SubClause::IsMounted(Id::SortPopup),
+    ]
+}

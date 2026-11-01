@@ -1,0 +1,431 @@
+use std::borrow::Cow;
+use std::path::Path;
+
+use anyhow::Result;
+use tuirealm::props::{
+    AttrValue, Attribute, HorizontalAlignment, PropPayload, PropValue, SpanStatic, Style, Title,
+};
+use tuirealm::ratatui::layout::{Constraint, Layout};
+use tuirealm::ratatui::widgets::Clear;
+use tuirealm::state::State;
+use tuirealm::terminal::TerminalAdapter;
+
+use super::TETrack;
+use crate::ui::components::tag_editor::te_footer::TEFooter;
+use crate::ui::components::{
+    LabelGeneric, TECounterDelete, TECounterSave, TEInputAlbum, TEInputArtist, TEInputGenre,
+    TEInputTitle, TESelectLyric, TETableLyricOptions, TETextareaLyric,
+};
+use crate::ui::ids::{Id, IdTagEditor};
+use crate::ui::model::Model;
+use crate::ui::utils::{draw_area_in_absolute, draw_area_top_right_absolute};
+
+impl Model {
+    /// Draw the Tag Editor.
+    #[allow(clippy::too_many_lines)]
+    pub fn view_tag_editor(&mut self) {
+        self.terminal
+            .draw(|f| {
+                let select_lyric_len =
+                    match self.app.state(&Id::TagEditor(IdTagEditor::SelectLyric)) {
+                        Ok(State::Single(_)) => 3,
+                        _ => 8,
+                    };
+                if self.app.mounted(&Id::TagEditor(IdTagEditor::LabelHint)) {
+                    f.render_widget(Clear, f.area());
+                    let chunks_main = Layout::vertical([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        // Constraint::Length(3),
+                        Constraint::Min(2),
+                        Constraint::Length(1),
+                    ])
+                    .split(f.area());
+
+                    let chunks_row1 =
+                        Layout::horizontal([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
+                            .split(chunks_main[1]);
+                    let chunks_row2 = Layout::horizontal([
+                        Constraint::Ratio(1, 4),
+                        Constraint::Ratio(1, 4),
+                        Constraint::Ratio(1, 4),
+                        Constraint::Ratio(1, 4),
+                    ])
+                    .split(chunks_main[2]);
+                    let chunks_row4 =
+                        Layout::horizontal([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
+                            .split(chunks_main[3]);
+
+                    let chunks_row4_right = Layout::vertical([
+                        Constraint::Length(select_lyric_len),
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                    ])
+                    .split(chunks_row4[1]);
+
+                    let chunks_row4_right_middle =
+                        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                            .split(chunks_row4_right[1]);
+
+                    // -- footer
+                    if self.download_tracker.visible() {
+                        let chunks_footer = Layout::horizontal([
+                            Constraint::Length(1),
+                            Constraint::Length(1),
+                            Constraint::Min(10),
+                        ])
+                        .split(chunks_main[4]);
+
+                        self.app.view(&Id::DownloadSpinner, f, chunks_footer[1]);
+                        self.app.view(&Id::Label, f, chunks_footer[2]);
+                    } else {
+                        self.app.view(&Id::Label, f, chunks_main[4]);
+                    }
+
+                    self.app
+                        .view(&Id::TagEditor(IdTagEditor::LabelHint), f, chunks_main[0]);
+                    // self.app.view(&Id::Label, f, chunks_main[4]);
+                    self.app
+                        .view(&Id::TagEditor(IdTagEditor::InputArtist), f, chunks_row1[0]);
+                    self.app
+                        .view(&Id::TagEditor(IdTagEditor::InputTitle), f, chunks_row1[1]);
+                    self.app
+                        .view(&Id::TagEditor(IdTagEditor::InputAlbum), f, chunks_row2[0]);
+                    self.app
+                        .view(&Id::TagEditor(IdTagEditor::InputGenre), f, chunks_row2[1]);
+                    let common_style = Style::new().bg(self
+                        .config_tui
+                        .read_recursive()
+                        .settings
+                        .theme
+                        .fallback_background());
+                    f.buffer_mut().set_style(chunks_row2[2], common_style);
+                    f.buffer_mut().set_style(chunks_row2[3], common_style);
+                    self.app.view(
+                        &Id::TagEditor(IdTagEditor::TableLyricOptions),
+                        f,
+                        chunks_row4[0],
+                    );
+                    self.app.view(
+                        &Id::TagEditor(IdTagEditor::SelectLyric),
+                        f,
+                        chunks_row4_right[0],
+                    );
+                    self.app.view(
+                        &Id::TagEditor(IdTagEditor::CounterDelete),
+                        f,
+                        chunks_row4_right_middle[0],
+                    );
+                    self.app.view(
+                        &Id::TagEditor(IdTagEditor::CounterSave),
+                        f,
+                        chunks_row4_right_middle[1],
+                    );
+                    self.app.view(
+                        &Id::TagEditor(IdTagEditor::TextareaLyric),
+                        f,
+                        chunks_row4_right[2],
+                    );
+
+                    if self.app.mounted(&Id::MessagePopup) {
+                        let popup = draw_area_top_right_absolute(f.area(), 25, 4);
+                        f.render_widget(Clear, popup);
+                        self.app.view(&Id::MessagePopup, f, popup);
+                    }
+                    if self.app.mounted(&Id::ErrorPopup) {
+                        let popup = draw_area_in_absolute(f.area(), 50, 4);
+                        f.render_widget(Clear, popup);
+                        self.app.view(&Id::ErrorPopup, f, popup);
+                    }
+                }
+            })
+            .expect("Expected to draw without error");
+    }
+
+    /// Mount / Remount the Tag Editor.
+    fn remount_tageditor(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::Label,
+            Box::new(TEFooter::new(&self.config_tui.read())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::LabelHint),
+            Box::new(LabelGeneric::new(
+                &self.config_tui.read(),
+                "Press <ENTER> to search:",
+            )),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::InputArtist),
+            Box::new(TEInputArtist::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::InputTitle),
+            Box::new(TEInputTitle::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::InputAlbum),
+            Box::new(TEInputAlbum::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::InputGenre),
+            Box::new(TEInputGenre::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::TableLyricOptions),
+            Box::new(TETableLyricOptions::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::SelectLyric),
+            Box::new(TESelectLyric::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::CounterDelete),
+            Box::new(TECounterDelete::new(None, self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::CounterSave),
+            Box::new(TECounterSave::new(None, self.config_tui.clone())),
+            Vec::new(),
+        )?;
+        self.app.remount(
+            Id::TagEditor(IdTagEditor::TextareaLyric),
+            Box::new(TETextareaLyric::new(self.config_tui.clone())),
+            Vec::new(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Mount the tageditor with the given path.
+    pub fn mount_tageditor(&mut self, path: &Path) {
+        if path.is_dir() {
+            #[allow(clippy::unnecessary_debug_formatting)]
+            // we want debug information about a path (especially have it escaped)
+            self.mount_error_popup(anyhow::anyhow!("{path:#?} directory doesn't have tag!"));
+            return;
+        }
+
+        let te_track = match TETrack::read_metadata_from_file(path) {
+            Ok(v) => v,
+            Err(err) => {
+                self.mount_error_popup(err.context(path.display().to_string()));
+                return;
+            }
+        };
+
+        self.remount_tageditor().unwrap();
+
+        self.app
+            .active(&Id::TagEditor(IdTagEditor::InputArtist))
+            .ok();
+
+        // the unwrap should also never happen as all components should be properly mounted
+        self.init_by_song(te_track).unwrap();
+
+        if let Err(err) = self.update_photo() {
+            self.mount_error_popup(err.context("update_photo"));
+        }
+    }
+
+    /// Unmount the Tag Editor Components.
+    fn umount_tageditor_inner(&mut self) -> Result<()> {
+        self.app.umount(&Id::TagEditor(IdTagEditor::LabelHint))?;
+        self.app.umount(&Id::TagEditor(IdTagEditor::InputArtist))?;
+        self.app.umount(&Id::TagEditor(IdTagEditor::InputTitle))?;
+        self.app.umount(&Id::TagEditor(IdTagEditor::InputAlbum))?;
+        self.app.umount(&Id::TagEditor(IdTagEditor::InputGenre))?;
+        self.app
+            .umount(&Id::TagEditor(IdTagEditor::TableLyricOptions))?;
+        self.app.umount(&Id::TagEditor(IdTagEditor::SelectLyric))?;
+        self.app
+            .umount(&Id::TagEditor(IdTagEditor::CounterDelete))?;
+        self.app.umount(&Id::TagEditor(IdTagEditor::CounterSave))?;
+        self.app
+            .umount(&Id::TagEditor(IdTagEditor::TextareaLyric))?;
+
+        Ok(())
+    }
+
+    /// Unmount all tag editor components.
+    pub fn umount_tageditor(&mut self) {
+        self.mount_label_help();
+        self.umount_tageditor_inner()
+            .expect("Expected TagEditor to unmount correctly");
+        if let Err(e) = self.update_photo() {
+            self.mount_error_popup(e.context("update_photo"));
+        }
+    }
+
+    /// Set the Lyric section of the tag-editor to the Lyrics based on the provided Track
+    pub fn init_by_song(&mut self, track: TETrack) -> Result<()> {
+        self.tageditor.song = Some(track);
+
+        self.init_metadata()?;
+
+        self.init_lyric_data()
+    }
+
+    /// Read the metadata from the current track and set it to the Tag Editor fields.
+    ///
+    /// Expects a current `tageditor_song` to be set.
+    fn init_metadata(&mut self) -> Result<()> {
+        let Some(track) = self.tageditor.song.as_ref() else {
+            // No Metadata to change.
+            return Ok(());
+        };
+        if let Some(artist) = track.artist() {
+            self.app.attr(
+                &Id::TagEditor(IdTagEditor::InputArtist),
+                Attribute::Value,
+                AttrValue::String(artist.to_string()),
+            )?;
+        }
+
+        if let Some(title) = track.title() {
+            self.app.attr(
+                &Id::TagEditor(IdTagEditor::InputTitle),
+                Attribute::Value,
+                AttrValue::String(title.to_string()),
+            )?;
+        }
+
+        if let Some(album) = track.album() {
+            self.app.attr(
+                &Id::TagEditor(IdTagEditor::InputAlbum),
+                Attribute::Value,
+                AttrValue::String(album.to_string()),
+            )?;
+        }
+
+        if let Some(genre) = track.genre() {
+            self.app.attr(
+                &Id::TagEditor(IdTagEditor::InputGenre),
+                Attribute::Value,
+                AttrValue::String(genre.to_string()),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract the lyric data from the current track and set it in the Tag Editor fields.
+    fn init_lyric_data(&mut self) -> Result<()> {
+        let track = self.tageditor.song.as_ref().unwrap();
+        let lyric_frames = track.lyric_frames();
+
+        if lyric_frames.is_empty() {
+            return self.init_lyric_data_empty();
+        }
+
+        let vec_lang: Vec<PropValue> = lyric_frames
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                let val = &v.description;
+                // match idx with Delete counter
+                let idx = idx + 1;
+                if val.is_empty() {
+                    format!("{idx} - {}", v.lang)
+                } else {
+                    format!("{idx} - {val}")
+                }
+            })
+            .map(PropValue::Str)
+            .collect();
+
+        let selected_index = track.lyric_selected_index();
+        // get access to "Lyric" instance for text and modified description for display
+        let (Some(vec_lang_selected), Some(selected_desc)) =
+            (track.lyric_selected(), vec_lang.get(selected_index))
+        else {
+            // this should not happen as if it is Some above, there should be at least one entry in the vec.
+            return self.init_lyric_data_empty();
+        };
+        let selected_desc = selected_desc
+            .as_str()
+            .map_or_else(|| "No Description".into(), Cow::from);
+        let selected_description = format!("Lyrics for {selected_desc}");
+        let selected_index_display = selected_index + 1;
+
+        let vec_lyric = vec_lang_selected
+            .text
+            .lines()
+            .map(|line| PropValue::TextSpan(SpanStatic::from(line.trim().to_string())))
+            .collect();
+
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::SelectLyric),
+            Attribute::Content,
+            AttrValue::Payload(PropPayload::Vec(vec_lang)),
+        )?;
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::CounterDelete),
+            Attribute::Value,
+            AttrValue::Payload(PropPayload::Single(PropValue::Usize(
+                selected_index_display,
+            ))),
+        )?;
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::CounterSave),
+            Attribute::Value,
+            AttrValue::Payload(PropPayload::Single(PropValue::Usize(
+                selected_index_display,
+            ))),
+        )?;
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::TextareaLyric),
+            Attribute::Title,
+            AttrValue::Title(
+                Title::from(selected_description).alignment(HorizontalAlignment::Left),
+            ),
+        )?;
+
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::TextareaLyric),
+            Attribute::Text,
+            AttrValue::Payload(PropPayload::Vec(vec_lyric)),
+        )?;
+
+        Ok(())
+    }
+
+    /// Set the Lyric section of the tag-editor to "No Lyrics" (ie clear state)
+    fn init_lyric_data_empty(&mut self) -> Result<()> {
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::SelectLyric),
+            Attribute::Content,
+            AttrValue::Payload(PropPayload::Vec(vec![PropValue::Str("Empty".to_string())])),
+        )?;
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::CounterDelete),
+            Attribute::Value,
+            AttrValue::Payload(PropPayload::None),
+        )?;
+
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::TextareaLyric),
+            Attribute::Title,
+            AttrValue::Title(Title::from("Empty Lyrics").alignment(HorizontalAlignment::Left)),
+        )?;
+        self.app.attr(
+            &Id::TagEditor(IdTagEditor::TextareaLyric),
+            Attribute::Text,
+            AttrValue::Payload(PropPayload::Vec(vec![PropValue::TextSpan(
+                SpanStatic::from("No Lyrics."),
+            )])),
+        )?;
+
+        Ok(())
+    }
+}

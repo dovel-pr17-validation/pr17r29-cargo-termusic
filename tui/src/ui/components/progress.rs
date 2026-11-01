@@ -1,0 +1,203 @@
+use std::ops::Div;
+use std::time::Duration;
+
+use anyhow::Result;
+use termusiclib::config::TuiOverlay;
+use termusiclib::player::RunningStatus;
+use termusiclib::track::DurationFmtShort;
+use termusiclib::track::MediaTypesSimple;
+use tui_realm_stdlib::components::Gauge;
+use tuirealm::component::AppComponent;
+use tuirealm::component::Component;
+use tuirealm::event::Event;
+use tuirealm::props::AttrValue;
+use tuirealm::props::Attribute;
+use tuirealm::props::HorizontalAlignment;
+use tuirealm::props::Style;
+use tuirealm::props::Title;
+use tuirealm::props::{BorderType, Borders, PropPayload, PropValue};
+
+use crate::ui::Model;
+use crate::ui::ids::Id;
+use crate::ui::model::UserEvent;
+use crate::ui::msg::Msg;
+
+#[derive(Component)]
+pub struct Progress {
+    component: Gauge,
+}
+
+impl Progress {
+    #[allow(clippy::cast_precision_loss)]
+    pub fn new(config: &TuiOverlay) -> Self {
+        Self {
+            component: Gauge::default()
+                .borders(
+                    Borders::default()
+                        .color(config.settings.theme.progress_border())
+                        .modifiers(BorderType::Rounded),
+                )
+                .background(config.settings.theme.progress_background())
+                .foreground(config.settings.theme.progress_foreground())
+                .inactive(Style::new().bg(config.settings.theme.progress_background()))
+                .label("Progress")
+                .title(
+                    Title::from(" Status: Stopped | Volume: ?? | Speed: ??.? ")
+                        .alignment(HorizontalAlignment::Center),
+                )
+                .progress(0.0),
+        }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for Progress {
+    fn on(&mut self, _ev: &Event<UserEvent>) -> Option<Msg> {
+        None
+    }
+}
+
+#[allow(clippy::cast_precision_loss)] // speed is never realisitcally expected to be above i16::MAX
+fn title_format(
+    status: RunningStatus,
+    title: Option<&str>,
+    volume: u16,
+    speed: i32,
+    gapless: bool,
+) -> String {
+    let gapless = if gapless { "True" } else { "False" };
+
+    if let Some(title) = title {
+        format!(
+            " Status: {} {:^.20} | Volume: {} | Speed: {:^.1} | Gapless: {} ",
+            status,
+            title,
+            volume,
+            speed as f32 / 10.0,
+            gapless,
+        )
+    } else {
+        format!(
+            " Status: {} | Volume: {} | Speed: {:^.1} | Gapless: {} ",
+            status,
+            volume,
+            speed as f32 / 10.0,
+            gapless,
+        )
+    }
+}
+
+impl Model {
+    /// Remount the Progress component
+    pub fn remount_progress(&mut self) -> Result<()> {
+        self.app.remount(
+            Id::Progress,
+            Box::new(Progress::new(&self.config_tui.read())),
+            Vec::new(),
+        )?;
+        self.progress_update_title();
+
+        Ok(())
+    }
+
+    /// Update the [`Progress`] component's title.
+    ///
+    /// This needs to be run if one of the following changes:
+    /// - volume
+    /// - speed
+    /// - gapless
+    /// - running status
+    /// - moving onto / off a podcast track
+    pub fn progress_update_title(&mut self) {
+        let config_server = self.config_server.read();
+        let player = &config_server.settings.player;
+
+        let progress_title = if let Some(track) = self.playback.current_track() {
+            match track.media_type() {
+                MediaTypesSimple::Music | MediaTypesSimple::LiveRadio => title_format(
+                    self.playback.status(),
+                    None,
+                    player.volume,
+                    player.speed,
+                    player.gapless,
+                ),
+                MediaTypesSimple::Podcast => {
+                    let title = track.as_track().map_or_else(
+                        || "Loading...",
+                        |track| track.title().unwrap_or("Unknown title"),
+                    );
+
+                    title_format(
+                        self.playback.status(),
+                        Some(title),
+                        player.volume,
+                        player.speed,
+                        player.gapless,
+                    )
+                }
+            }
+        } else {
+            title_format(
+                self.playback.status(),
+                None,
+                player.volume,
+                player.speed,
+                player.gapless,
+            )
+        };
+
+        drop(config_server);
+        let _ = self.app.attr(
+            &Id::Progress,
+            Attribute::Title,
+            AttrValue::Title(Title::from(progress_title).alignment(HorizontalAlignment::Center)),
+        );
+
+        self.force_redraw();
+    }
+
+    /// Handle progress updates.
+    ///
+    /// Updates all places where progress updates need to be populated to.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn progress_update(&mut self, time_pos: Option<Duration>, total_duration: Duration) {
+        let time_pos = time_pos.unwrap_or_default();
+
+        self.playback.set_current_track_pos(time_pos);
+
+        let progress = if time_pos.as_millis() > 0 && total_duration.as_millis() > 0 {
+            (time_pos.as_millis() as f64).div(total_duration.as_millis() as f64)
+        } else {
+            0.0
+        };
+
+        let progress = progress.clamp(0.0, 1.0);
+
+        self.progress_set(progress, total_duration);
+        self.lyric_update();
+    }
+
+    /// Set the progress bar text.
+    fn progress_set(&mut self, mut progress: f64, total_duration: Duration) {
+        let text = if self.playback.is_stopped() {
+            progress = 0.0;
+            DurationFmtShort::fmt_empty().to_string()
+        } else if total_duration.is_zero() {
+            format!("{}", DurationFmtShort(self.playback.current_track_pos()))
+        } else {
+            format!(
+                "{}    -    {}",
+                DurationFmtShort(self.playback.current_track_pos()),
+                DurationFmtShort(total_duration),
+            )
+        };
+
+        let _ = self.app.attr(
+            &Id::Progress,
+            Attribute::Value,
+            AttrValue::Payload(PropPayload::Single(PropValue::F64(progress))),
+        );
+        let _ = self
+            .app
+            .attr(&Id::Progress, Attribute::Text, AttrValue::String(text));
+    }
+}

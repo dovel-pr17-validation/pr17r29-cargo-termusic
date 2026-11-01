@@ -1,0 +1,214 @@
+use clap::{ArgAction, Parser, Subcommand, ValueEnum, builder::ArgPredicate};
+use std::path::PathBuf;
+use termusiclib::config::v2::server::Backend as ConfigBackend;
+use termusiclib::player::protobuf::queue::{SortCriterion, SortDirection};
+
+#[derive(Parser, Debug)]
+// mostly read from `Cargo.toml`
+#[clap(name = "Termusic", author, version = env!("TERMUSIC_VERSION"), about, long_about=None)]
+pub struct Args {
+    /// Subcommands, overwriting default action of starting the TUI
+    #[command(subcommand)]
+    pub action: Option<Action>,
+    /// With no `MUSIC_DIRECTORY`, use config in `~/.config/termusic/config.toml`,
+    /// default is ~/Music.
+    pub music_directory: Option<PathBuf>,
+    /// Not showing album cover. default is showing.
+    #[arg(short = 'c', long)]
+    pub hide_cover: bool,
+    /// Disable cover support, even if compiled-in.
+    #[arg(long)]
+    pub disable_cover: bool,
+    /// Not showing discord representation. default is showing.
+    #[arg(short, long)]
+    pub disable_discord: bool,
+    /// Max depth(NUMBER) of folder, default is 4.
+    #[arg(short, long)]
+    pub max_depth: Option<u32>,
+    /// Select the backend, default is `rusty`
+    #[arg(short, long, env = "TMS_BACKEND")]
+    pub backend: Option<Backend>,
+    #[clap(flatten)]
+    pub log_options: LogOptions,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Backend {
+    Rusty,
+    Mpv,
+    #[value(alias = "gst", name = "gstreamer")]
+    GStreamer,
+}
+
+impl From<Backend> for ConfigBackend {
+    fn from(value: Backend) -> Self {
+        match value {
+            Backend::Rusty => Self::Rusty,
+            Backend::Mpv => Self::Mpv,
+            Backend::GStreamer => Self::Gstreamer,
+        }
+    }
+}
+
+impl Backend {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        // reuse the config "as_str" impl
+        <Self as Into<ConfigBackend>>::into(self).as_str()
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Subcommands for the binary
+#[derive(Subcommand, Debug)]
+pub enum Action {
+    /// Podcast management commands.
+    #[command(subcommand)]
+    Podcast(PodcastAction),
+    /// Playlist management commands.
+    #[command(subcommand)]
+    Playlist(PlaylistAction),
+    /// Skip to next track
+    #[command(aliases = &["n"])]
+    Next,
+    /// Skip to previous track
+    #[command(aliases = &["p", "prev"])]
+    Previous,
+    /// Resume playback
+    #[command(aliases = &["unpause", "resume"])]
+    Play,
+    /// Pause playback
+    Pause,
+    /// Toggle play/pause
+    #[command(aliases = &["t", "play-pause"])]
+    TogglePause,
+    /// Increase volume
+    #[command(aliases = &["v-up", "volumeup"])]
+    VolumeUp,
+    /// Decrease volume
+    #[command(aliases = &["v-down", "volumedown"])]
+    VolumeDown,
+    /// Increase playback speed
+    SpeedUp,
+    /// Decrease playback speed
+    SpeedDown,
+    /// Restart current track
+    RestartTrack,
+    /// Seek forward
+    SeekForward,
+    /// Seek backward
+    SeekBackward,
+    /// Quit the server
+    Quit,
+}
+
+/// Podcast management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum PodcastAction {
+    /// Export Podcast feeds to a opml file.
+    Export {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Import Podcast feeds from a opml file.
+    Import {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Refresh all podcast feeds.
+    Refresh,
+}
+
+/// Playlist management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum PlaylistAction {
+    /// Shuffle the current playlist.
+    Shuffle,
+    /// Sort the current playlist.
+    Sort {
+        /// Sort criterion.
+        #[arg(value_enum)]
+        criterion: SortCli,
+        /// Invert the default sort direction.
+        #[arg(short, long)]
+        invert: bool,
+    },
+    /// Cycle loop mode (list -> track -> one -> list).
+    CycleLoop,
+}
+
+/// Sort criterion for playlist sorting.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum SortCli {
+    Alphanumeric,
+    #[value(name = "atoz")]
+    AtoZ,
+    #[value(name = "ztoa")]
+    ZtoA,
+    FirstAdded,
+    LastAdded,
+    Duration,
+    HighestDuration,
+    LowestDuration,
+    MostPlayed,
+    LeastPlayed,
+    Recency,
+    Frecency,
+}
+
+impl SortCli {
+    /// Returns the base sort criterion and the default sort direction.
+    pub fn into_criterion_and_direction(self) -> (SortCriterion, SortDirection) {
+        match self {
+            Self::Alphanumeric | Self::AtoZ => (SortCriterion::Alphanumeric, SortDirection::Asc),
+            Self::ZtoA => (SortCriterion::Alphanumeric, SortDirection::Desc),
+            Self::FirstAdded => (SortCriterion::FirstAdded, SortDirection::Asc),
+            Self::LastAdded => (SortCriterion::FirstAdded, SortDirection::Desc),
+            Self::Duration | Self::LowestDuration => (SortCriterion::Duration, SortDirection::Asc),
+            Self::HighestDuration => (SortCriterion::Duration, SortDirection::Desc),
+            Self::MostPlayed => (SortCriterion::MostPlayed, SortDirection::Desc),
+            Self::LeastPlayed => (SortCriterion::MostPlayed, SortDirection::Asc),
+            Self::Recency => (SortCriterion::Recency, SortDirection::Asc),
+            Self::Frecency => (SortCriterion::Frecency, SortDirection::Asc),
+        }
+    }
+}
+
+const DEFAULT_LOGFILE_FILENAME: &str = "termusic-tui.log";
+
+#[derive(Debug, Parser, Clone, PartialEq)]
+pub struct LogOptions {
+    /// Enable logging to a file,
+    /// automatically enabled if "log-file" is manually set
+    #[arg(
+        long = "log-to-file",
+        env = "TM_LOGTOFILE",
+        // automatically enable "log-to-file" if "log-file" is set, unless explicitly told not to
+        default_value_if("log_file", ArgPredicate::IsPresent, "true"),
+        action = ArgAction::Set,
+        default_value_t = true,
+        // somehow clap has this option not properly supported in derive, so it needs to be a string
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+    )]
+    pub log_to_file: bool,
+
+    /// Set logging file
+    #[arg(long = "log-file", default_value_os_t = default_logfile_path(), env = "TM_LOGFILE")]
+    pub log_file: PathBuf,
+
+    /// Use colored logging for files
+    /// Example: live tailing via `tail -f /logfile`
+    #[arg(long = "log-filecolor", env = "TM_LOGFILE_COLOR")]
+    pub file_color_log: bool,
+}
+
+fn default_logfile_path() -> PathBuf {
+    std::env::temp_dir().join(DEFAULT_LOGFILE_FILENAME)
+}

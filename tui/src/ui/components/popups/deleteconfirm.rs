@@ -1,0 +1,191 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use termusiclib::config::{SharedTuiSettings, TuiOverlay};
+use tui_realm_stdlib::components::Input;
+use tuirealm::{
+    command::{Cmd, CmdResult, Direction, Position},
+    component::{AppComponent, Component},
+    event::{Event, Key, KeyEvent, KeyModifiers},
+    props::{BorderType, Borders, HorizontalAlignment, InputType, Title},
+    state::{State, StateValue},
+};
+
+use super::{YNConfirm, YNConfirmStyle};
+use crate::ui::ids::Id;
+use crate::ui::model::{Model, UserEvent};
+use crate::ui::msg::{DeleteConfirmMsg, Msg};
+
+/// Component for a "Are you sure to delete? Y/N" popup
+///
+/// Also see [`DeleteConfirmInputPopup`].
+#[derive(Component)]
+pub struct DeleteConfirmRadioPopup {
+    component: YNConfirm,
+    on_confirm: Msg,
+    on_cancel: Msg,
+}
+
+impl DeleteConfirmRadioPopup {
+    pub fn new(config: SharedTuiSettings, on_confirm: Msg, on_cancel: Msg) -> Self {
+        let component =
+            YNConfirm::new_with_cb(config, " Are sure you want to delete? ", |config| {
+                YNConfirmStyle {
+                    foreground_color: config.settings.theme.important_popup_foreground(),
+                    background_color: config.settings.theme.important_popup_background(),
+                    border_color: config.settings.theme.important_popup_border(),
+                    title_alignment: HorizontalAlignment::Left,
+                }
+            });
+
+        Self {
+            component,
+            on_confirm,
+            on_cancel,
+        }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for DeleteConfirmRadioPopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        self.component
+            .on(ev, self.on_confirm.clone(), self.on_cancel.clone())
+    }
+}
+
+/// Component for a "Are you sure to delete? Write DELETE" popup
+///
+/// Also see [`DeleteConfirmRadioPopup`]
+#[derive(Component)]
+pub struct DeleteConfirmInputPopup {
+    component: Input,
+    on_confirm: Msg,
+    on_cancel: Msg,
+}
+
+impl DeleteConfirmInputPopup {
+    pub fn new(config: &TuiOverlay, title: &str, on_confirm: Msg, on_cancel: Msg) -> Self {
+        let config = &config.settings;
+        Self {
+            component: Input::default()
+                .foreground(config.theme.important_popup_foreground())
+                .background(config.theme.important_popup_background())
+                .borders(
+                    Borders::default()
+                        .color(config.theme.important_popup_border())
+                        .modifiers(BorderType::Rounded),
+                )
+                // .invalid_style(Style::default().fg(Color::Red))
+                .input_type(InputType::Text)
+                .title(
+                    Title::from(format!(" {title} Type DELETE to confirm: "))
+                        .alignment(HorizontalAlignment::Left),
+                ),
+            on_confirm,
+            on_cancel,
+        }
+    }
+}
+
+impl AppComponent<Msg, UserEvent> for DeleteConfirmInputPopup {
+    fn on(&mut self, ev: &Event<UserEvent>) -> Option<Msg> {
+        let cmd_result = match ev {
+            Event::Keyboard(KeyEvent {
+                code: Key::Left, ..
+            }) => self.perform(Cmd::Move(Direction::Left)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Right, ..
+            }) => self.perform(Cmd::Move(Direction::Right)),
+            Event::Keyboard(KeyEvent {
+                code: Key::Home, ..
+            }) => self.perform(Cmd::GoTo(Position::Begin)),
+            Event::Keyboard(KeyEvent { code: Key::End, .. }) => {
+                self.perform(Cmd::GoTo(Position::End))
+            }
+            Event::Keyboard(KeyEvent {
+                code: Key::Delete, ..
+            }) => self.perform(Cmd::Cancel),
+            Event::Keyboard(KeyEvent {
+                code: Key::Backspace,
+                ..
+            }) => self.perform(Cmd::Delete),
+            Event::Keyboard(KeyEvent {
+                code: Key::Char(ch),
+                modifiers: KeyModifiers::SHIFT | KeyModifiers::NONE,
+            }) => self.perform(Cmd::Type(*ch)),
+            Event::Keyboard(KeyEvent { code: Key::Esc, .. }) => {
+                return Some(self.on_cancel.clone());
+            }
+            Event::Keyboard(KeyEvent {
+                code: Key::Enter, ..
+            }) => self.perform(Cmd::Submit),
+            _ => CmdResult::NoChange,
+        };
+        match cmd_result {
+            CmdResult::Submit(State::Single(StateValue::String(input_string))) => {
+                if input_string == *"DELETE" {
+                    return Some(self.on_confirm.clone());
+                }
+                Some(self.on_cancel.clone())
+            }
+            CmdResult::NoChange => None,
+            _ => Some(Msg::ForceRedraw),
+        }
+    }
+}
+
+impl Model {
+    /// Mount a [`DeleteConfirmRadioPopup`] with specific Messages on ok & cancel
+    /// as [`Id::DeleteConfirmRadioPopup`].
+    pub fn mount_confirm_radio(&mut self, path: PathBuf, focus_node: Option<String>) -> Result<()> {
+        self.app.remount(
+            Id::DeleteConfirmRadioPopup,
+            Box::new(DeleteConfirmRadioPopup::new(
+                self.config_tui.clone(),
+                Msg::DeleteConfirm(DeleteConfirmMsg::CloseOk(path, focus_node)),
+                Msg::DeleteConfirm(DeleteConfirmMsg::CloseCancel),
+            )),
+            vec![],
+        )?;
+        self.app.active(&Id::DeleteConfirmRadioPopup)?;
+
+        Ok(())
+    }
+
+    /// Umount the Delete Confirm Radio Popup.
+    pub fn umount_confirm_radio(&mut self) -> Result<()> {
+        self.app.umount(&Id::DeleteConfirmRadioPopup)?;
+
+        Ok(())
+    }
+
+    /// Mount a [`DeleteConfirmInputPopup`] with specific Messages on ok & cancel
+    /// as [`Id::DeleteConfirmInputPopup`].
+    pub fn mount_confirm_input(
+        &mut self,
+        path: PathBuf,
+        focus_node: Option<String>,
+        title: &str,
+    ) -> Result<()> {
+        self.app.remount(
+            Id::DeleteConfirmInputPopup,
+            Box::new(DeleteConfirmInputPopup::new(
+                &self.config_tui.read(),
+                title,
+                Msg::DeleteConfirm(DeleteConfirmMsg::CloseOk(path, focus_node)),
+                Msg::DeleteConfirm(DeleteConfirmMsg::CloseCancel),
+            )),
+            vec![],
+        )?;
+        self.app.active(&Id::DeleteConfirmInputPopup)?;
+
+        Ok(())
+    }
+
+    /// Umount the Delete Confirm Input Popup.
+    pub fn umount_confirm_input(&mut self) -> Result<()> {
+        self.app.umount(&Id::DeleteConfirmInputPopup)?;
+
+        Ok(())
+    }
+}

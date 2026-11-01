@@ -1,0 +1,775 @@
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context as _, Result, bail};
+use clap::Parser;
+use parking_lot::{Mutex, RwLock};
+use termusiclib::config::v2::server::config_extra::ServerConfigVersionedDefaulted;
+use termusiclib::config::v2::server::{ComProtocol, ScanDepth, StartupState};
+use termusiclib::config::{ServerOverlay, SharedServerSettings, new_shared_server_settings};
+use termusiclib::player::protobuf::player::player_control_server::PlayerControlServer;
+use termusiclib::player::protobuf::player::{GetProgressResponse, PlayerTime};
+use termusiclib::player::protobuf::queue::queue_control_server::QueueControlServer;
+use termusiclib::player::protobuf::server::server_control_server::ServerControlServer;
+use termusiclib::player::protobuf::stream::stream_events_server::StreamEventsServer;
+use termusiclib::player::{
+    ChangeLoopMode, ChangeSpeed, ChangeVolume, PlayerProgress, RunningStatus, SeekReq,
+};
+use termusiclib::track::{MediaTypesSimple, Track};
+use termusiclib::{podcast, utils};
+use termusicplayback::player_cmd::{
+    PlayerCmd, PlayerCmdReciever, PlayerCmdSender, PlayerErrorType,
+};
+use termusicplayback::{
+    Backend, BackendSelect, GeneralPlayer, PlayerTrait, Playlist, RunInfo, SharedPlaylist,
+    SharedRunInfo, SpeedSigned, VolumeSigned, quit_sources,
+};
+use tokio::runtime::Handle;
+use tokio::select;
+use tokio::sync::{broadcast, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::Server;
+
+use crate::connection::{ActiveConnectionData, ActiveConnections, tcp_stream};
+use crate::services::{
+    PlayerControlService, QueueControlService, ServerControlService, StreamEventsService,
+};
+
+mod cli;
+mod connection;
+mod logger;
+mod services;
+
+#[macro_use]
+extern crate log;
+
+pub const MAX_DEPTH: usize = 4;
+pub const SPEED_STEP: SpeedSigned = 1;
+
+/// The Limit of continues errors before stopping playback and awaiting user input to start something specific again.
+const BACKEND_ERROR_LIMIT: NonZeroUsize = NonZeroUsize::new(5).unwrap();
+
+/// Stats for the music player responses
+#[derive(Debug, Clone, PartialEq)]
+struct PlayerStats {
+    pub progress: PlayerProgress,
+    pub current_track_index: u64,
+    pub radio_title: String,
+}
+
+impl PlayerStats {
+    pub fn new() -> Self {
+        Self {
+            progress: PlayerProgress {
+                position: None,
+                total_duration: None,
+            },
+            current_track_index: 0,
+            radio_title: String::new(),
+        }
+    }
+
+    pub fn as_getprogress_response(
+        &self,
+        status: RunningStatus,
+        config: &ServerOverlay,
+    ) -> GetProgressResponse {
+        GetProgressResponse {
+            progress: Some(self.as_playertime()),
+            current_track_index: self.current_track_index,
+            status: status.as_u32(),
+            radio_title: self.radio_title.clone(),
+            volume: u32::from(config.settings.player.volume),
+            speed: config.settings.player.speed,
+            gapless: config.settings.player.gapless,
+        }
+    }
+
+    pub fn as_playertime(&self) -> PlayerTime {
+        self.progress.into()
+    }
+}
+
+fn main() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let res = termusicplayback::macos::run_with_run_loop(actual_main);
+    #[cfg(not(target_os = "macos"))]
+    let res = actual_main();
+
+    trace!("Tokio Exited");
+
+    if let Err(err) = res {
+        error!("Error: {err:?}");
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn actual_main() -> Result<()> {
+    let args = cli::Args::parse();
+    let _ = logger::setup(&args);
+    let config = get_config(&args)?;
+
+    if let Some(action) = args.action {
+        return execute_action(action, &config).await;
+    }
+
+    info!("Server starting...");
+
+    // do this before anything else so that we exit early on invalid/unavailable backends
+    let backend = {
+        let config_backend = config.settings.player.backend.try_into();
+
+        if let Some(backend) = args.backend {
+            trace!("Backend from CLI");
+
+            // dont panic if the config backend is unavailable, but also warn somehow
+            if let Err(err) = config_backend {
+                warn!("Error parsing backend from config: {err}");
+            }
+
+            backend.into()
+        } else {
+            trace!("Backend from Config");
+            config_backend?
+        }
+    };
+
+    let config = new_shared_server_settings(config);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cmd_tx = PlayerCmdSender::new(cmd_tx);
+    // Note that the channel size might quickly become too low if there is a massive delete (like removing the non-existent tracks from the playlist)
+    let (stream_tx, _) = broadcast::channel(64); // at current, this should use about 64 * 64 = 4096 (bytes), or 4kb for short
+
+    let playlist =
+        Playlist::new_shared(&config, stream_tx.clone()).context("Failed to load playlist")?;
+
+    let run_info = Arc::new(RwLock::new(RunInfo::default()));
+
+    let server_ctrl_svc = ServerControlService::new(cmd_tx.clone());
+    let player_ctrl_svc =
+        PlayerControlService::new(cmd_tx.clone(), config.clone(), run_info.clone());
+    let queue_ctrl_svc = QueueControlService::new(cmd_tx.clone(), config.clone(), playlist.clone());
+    let stream_svc = StreamEventsService::new(stream_tx.clone());
+    let playerstats = player_ctrl_svc.player_stats.clone();
+
+    let cmd_tx_ctrlc = cmd_tx.clone();
+    let cmd_tx_ticker = cmd_tx.clone();
+
+    ctrlc::set_handler(move || {
+        cmd_tx_ctrlc
+            .send(PlayerCmd::Quit(quit_sources::CTRLC))
+            .expect("Could not send signal on channel.");
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    let service_cancel_token = CancellationToken::new();
+
+    let (join_handle, active_connections_data) = start_service(
+        &config,
+        server_ctrl_svc,
+        player_ctrl_svc,
+        queue_ctrl_svc,
+        stream_svc,
+        service_cancel_token.clone(),
+    )
+    .await?;
+
+    let tokio_handle = Handle::current();
+
+    let cancel_token = service_cancel_token.clone();
+    let playlist_c = playlist.clone();
+    start_playlist_save_interval(tokio_handle.clone(), cancel_token, playlist_c);
+
+    let (player_handle_os_tx, player_handle_os_rx) = oneshot::channel();
+    let player_handle = std::thread::Builder::new()
+        .name("main player loop".into())
+        .spawn(move || {
+            let _guard = tokio_handle.enter();
+            let res = player_loop(
+                backend,
+                cmd_tx,
+                cmd_rx,
+                config,
+                playerstats,
+                stream_tx,
+                playlist,
+                run_info,
+                active_connections_data,
+            );
+            let _ = player_handle_os_tx.send(res);
+        })?;
+
+    ticker_thread(cmd_tx_ticker)?;
+
+    info!("Server ready");
+
+    // await the oneshot completing in a async fashion
+    player_handle_os_rx.await??;
+    // do this *after* the oneshot, because this is a blocking operation
+    // and by doing this after the oneshot we can be sure the thread is actually exited, or exiting
+    let _ = player_handle.join();
+
+    // ensure cleanup of the service tasks happens before main exits
+    service_cancel_token.cancel();
+    let _ = join_handle.await;
+
+    // Graceful exit log
+    info!("Bye");
+
+    Ok(())
+}
+
+const PLAYLIST_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Spawn a task to periodically save the playlist to disk, if modified.
+fn start_playlist_save_interval(
+    handle: Handle,
+    cancel_token: CancellationToken,
+    playlist: SharedPlaylist,
+) {
+    handle.spawn(async move {
+        let mut timer = tokio::time::interval_at(
+            Instant::now() + PLAYLIST_SAVE_INTERVAL,
+            PLAYLIST_SAVE_INTERVAL,
+        );
+        loop {
+            select! {
+                _ = timer.tick() => {
+                    match playlist.write().save_if_modified() {
+                        Err(err) => warn!("Error saving playlist in interval: {err:#?}"),
+                        Ok(true) => debug!("Saved playlist in interval"),
+                        Ok(false) => ()
+                    }
+                },
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Start all the services with the transport protocol defined in the config.
+async fn start_service(
+    config: &SharedServerSettings,
+    server_ctrl_svc: ServerControlService,
+    player_ctrl_svc: PlayerControlService,
+    queue_ctrl_svc: QueueControlService,
+    stream_svc: StreamEventsService,
+    cancel_token: CancellationToken,
+) -> Result<(
+    JoinHandle<Result<(), tonic::transport::Error>>,
+    ActiveConnections,
+)> {
+    let protocol = config.read().settings.com.protocol;
+
+    let server_ctrl_svc = ServerControlServer::new(server_ctrl_svc);
+    let player_ctrl_svc = PlayerControlServer::new(player_ctrl_svc);
+    let queue_ctrl_svc = QueueControlServer::new(queue_ctrl_svc);
+    let stream_svc = StreamEventsServer::new(stream_svc);
+    let active_connection_count: ActiveConnections = Arc::new(ActiveConnectionData::default());
+
+    let handle = match protocol {
+        ComProtocol::HTTP => {
+            let (tcp_stream, addr) = tcp_stream(config, active_connection_count.clone()).await?;
+            info!("Server listening on {addr}");
+
+            tokio::spawn(
+                Server::builder()
+                    .add_service(server_ctrl_svc)
+                    .add_service(player_ctrl_svc)
+                    .add_service(queue_ctrl_svc)
+                    .add_service(stream_svc)
+                    .serve_with_incoming_shutdown(tcp_stream, cancel_token.cancelled_owned()),
+            )
+        }
+        #[cfg(unix)]
+        ComProtocol::UDS => {
+            use crate::connection::uds_stream;
+
+            let (uds_stream, addr) = uds_stream(config, active_connection_count.clone()).await?;
+            info!("Server listening on {addr}");
+
+            tokio::spawn(
+                Server::builder()
+                    .add_service(server_ctrl_svc)
+                    .add_service(player_ctrl_svc)
+                    .add_service(queue_ctrl_svc)
+                    .add_service(stream_svc)
+                    .serve_with_incoming_shutdown(uds_stream, cancel_token.cancelled_owned()),
+            )
+        }
+        #[cfg(not(unix))]
+        ComProtocol::UDS => {
+            unimplemented!("UDS/Unix Domain Sockets are only implemented for Unix targets");
+        }
+    };
+
+    Ok((handle, active_connection_count))
+}
+
+/// The main player loop where we handle all events
+#[allow(clippy::too_many_arguments)]
+fn player_loop(
+    backend: BackendSelect,
+    cmd_tx: PlayerCmdSender,
+    mut cmd_rx: PlayerCmdReciever,
+    config: SharedServerSettings,
+    playerstats: Arc<Mutex<PlayerStats>>,
+    stream_tx: termusicplayback::StreamTX,
+    playlist: SharedPlaylist,
+    run_info: SharedRunInfo,
+    active_connections_data: ActiveConnections,
+) -> Result<()> {
+    let mut player =
+        GeneralPlayer::new_backend(backend, config, cmd_tx, stream_tx, playlist, run_info)?;
+
+    let mut had_enqueue_error = false;
+    let mut should_quit = false;
+
+    // Start the playback, if wanted on startup
+    if player.config.read().settings.player.startup_state == StartupState::Playing {
+        player.resume_from_stopped();
+    }
+
+    while let Some((cmd, cb)) = cmd_rx.blocking_recv() {
+        #[allow(unreachable_patterns)]
+        match cmd {
+            PlayerCmd::AboutToFinish => {
+                info!("about to finish signal received");
+                let playlist = player.playlist.read();
+                if !playlist.is_empty()
+                    && playlist.get_next_track().is_none()
+                    && player.config.read().settings.player.gapless
+                {
+                    drop(playlist);
+                    player.enqueue_next_from_playlist();
+                }
+            }
+            PlayerCmd::Quit(source) => {
+                info!("PlayerCmd::Quit received, source: \"{}\"", source);
+
+                // only quit if there are no more active clients OR a client triggered it and is the last client
+                if (source != quit_sources::CLIENT
+                    && active_connections_data.has_active_connections())
+                    || (source == quit_sources::CLIENT
+                        && active_connections_data.active_connection_count() > 1)
+                {
+                    info!("Not quiting server as there are other clients connected");
+                    should_quit = true;
+                } else {
+                    info!("No active clients connected. Quitting server");
+                    // to have a consistent last position
+                    player.pause();
+                    player.player_save_last_position();
+                    if let Err(e) = player.playlist.write().save() {
+                        error!("error when saving playlist: {e}");
+                    };
+                    // clear out all currently queued rodio sources
+                    // without this, on rusty backend, may keep the process around until the last source has been consumed
+                    player.stop();
+                    if let Err(e) = ServerConfigVersionedDefaulted::save_config_path(
+                        &player.config.read().settings,
+                    ) {
+                        error!("error when saving config: {e}");
+                    };
+                    return Ok(());
+                }
+            }
+            PlayerCmd::ChangeLoopMode(mode) => {
+                player.config.write().settings.player.loop_mode = match mode {
+                    ChangeLoopMode::Cycle => player.playlist.write().cycle_loop_mode(),
+                    ChangeLoopMode::Mode(loop_mode) => {
+                        player.playlist.write().set_loop_mode(loop_mode)
+                    }
+                }
+            }
+            PlayerCmd::Eos => {
+                info!("Eos received");
+                player_eos(&mut player, had_enqueue_error);
+                had_enqueue_error = false;
+            }
+            PlayerCmd::Error(ty) => {
+                info!("Error received: {ty:#?}");
+                player.increment_errors();
+
+                if ty == PlayerErrorType::Current {
+                    player_eos(&mut player, false);
+                } else {
+                    // delay handling until after finishing the current track
+                    had_enqueue_error = true;
+                }
+            }
+            PlayerCmd::SkipPrevious => {
+                player.reset_errors();
+                info!("skip to previous track");
+                player.previous();
+            }
+            PlayerCmd::ReloadConfig => {
+                if let Err(err) = player.reload_config() {
+                    error!("Reloading config failed, using old: {err:#?}");
+                }
+            }
+            PlayerCmd::Seek(seek) => {
+                debug!("Doing seek with {seek:#?}");
+                match seek {
+                    SeekReq::Steps(steps) => {
+                        if steps.is_positive() {
+                            for _ in 0..steps {
+                                player.seek_relative(true);
+                            }
+                        } else {
+                            for _ in steps..0 {
+                                player.seek_relative(false)
+                            }
+                        }
+                    }
+                    SeekReq::Unit(units) => {
+                        if let Err(err) = player.seek(units) {
+                            error!("Error running seek: {err:#?}");
+                        }
+                    }
+                    SeekReq::RestartTrack => player.restart_track(),
+                }
+            }
+            PlayerCmd::SkipNext => {
+                player.reset_errors();
+                info!("skip to next track.");
+                player.player_save_last_position();
+                player.next();
+            }
+            PlayerCmd::ChangeSpeed(speed) => {
+                match speed {
+                    ChangeSpeed::Steps(steps) => {
+                        if steps.is_positive() {
+                            for _ in 0..steps {
+                                player.add_speed(SPEED_STEP);
+                            }
+                        } else {
+                            for _ in steps..0 {
+                                player.add_speed(-SPEED_STEP);
+                            }
+                        }
+                    }
+                    ChangeSpeed::Unit(units) => {
+                        player.add_speed(units);
+                    }
+                    ChangeSpeed::Reset => {
+                        player.set_speed(0);
+                    }
+                };
+                let new_speed = player.speed();
+                info!("After speed change: {new_speed}");
+                player.config.write().settings.player.speed = new_speed;
+            }
+            PlayerCmd::Tick => {
+                // Quit once there are no more connections active and having had at least one connection.
+                // This should only quit if there was a quit event previously that was ignored.
+                if active_connections_data.had_first_connection()
+                    && !active_connections_data.has_active_connections()
+                    && should_quit
+                {
+                    info!(
+                        "No more active connections and had at least one client connected before, sending quit"
+                    );
+                    let _ = player.cmd_tx.send(PlayerCmd::Quit(quit_sources::TICK));
+                }
+
+                // info!("tick received");
+                player.mpris_handle_events();
+                let mut p_tick = playerstats.lock();
+                let mut playlist = player.playlist.read();
+
+                if let Some(progress) = player.get_progress() {
+                    p_tick.progress = progress;
+
+                    // the following function is "mut", which does not like having the immutable borrow to "playlist"
+                    // so we have to unlock first then later re-acquire the handle for later parts
+                    drop(playlist);
+                    player.update_progress(&p_tick.progress);
+
+                    // only reset errors if position is either above 0 or total duration is available and is above 0
+                    if player.run_info.read().is_playing()
+                        && (progress.total_duration.is_some_and(|v| v > Duration::ZERO)
+                            || progress.position.is_some_and(|v| v > Duration::ZERO))
+                    {
+                        player.reset_errors();
+                    }
+
+                    playlist = player.playlist.read();
+                }
+                p_tick.current_track_index =
+                    u64::try_from(playlist.get_current_track_index()).unwrap();
+                if let Some(track) = player.run_info.read().current_track() {
+                    update_metadata_changed(&mut p_tick, &player, track);
+                }
+            }
+            PlayerCmd::ToggleGapless => {
+                let new_gapless = player.toggle_gapless();
+                info!("after toggle gapless: {new_gapless}");
+            }
+            PlayerCmd::TogglePause => {
+                info!("player toggled pause");
+                player.toggle_pause();
+            }
+            PlayerCmd::ChangeVolume(vol) => {
+                match vol {
+                    ChangeVolume::Steps(steps) => {
+                        // Copy the step before the loop so the config read guard is not held across `add_volume`.
+                        let volume_step = VolumeSigned::from(
+                            player.config.read().settings.player.volume_step.get(),
+                        );
+                        if steps.is_positive() {
+                            for _ in 0..steps {
+                                player.add_volume(volume_step);
+                            }
+                        } else {
+                            for _ in steps..0 {
+                                player.add_volume(-volume_step);
+                            }
+                        }
+                    }
+                    ChangeVolume::Unit(units) => {
+                        player.add_volume(units);
+                    }
+                }
+                let new_vol = player.volume();
+                info!("After volume change: {new_vol}");
+                player.config.write().settings.player.volume = new_vol;
+            }
+            PlayerCmd::VolumeSet(volume) => {
+                let new_volume = player.set_volume(volume);
+                player.config.write().settings.player.volume = new_volume;
+                info!("After volume set: {new_volume}");
+            }
+            PlayerCmd::Pause => {
+                player.pause();
+            }
+            PlayerCmd::Play => {
+                player.resume();
+            }
+
+            PlayerCmd::PlaylistPlaySpecific(info) => {
+                player.reset_errors();
+                info!(
+                    "play specific track, idx: {} id: {:#?}",
+                    info.track_index, info.id
+                );
+                player.player_save_last_position();
+                if let Err(err) = player.play_specific(&info) {
+                    error!("Error setting specific track to play: {err}");
+                }
+            }
+            PlayerCmd::PlaylistAddTrack(info) => {
+                let mut playlist_write = player.playlist.write();
+                let was_empty = playlist_write.is_empty();
+                if let Err(err) = playlist_write.add_tracks(info, &player.db_podcast) {
+                    error!("Error adding tracks: {err}");
+                }
+                drop(playlist_write);
+
+                // automatically start the playlist once something is loaded into it, if it was empty before
+                if was_empty {
+                    player.resume_from_stopped();
+                }
+            }
+            PlayerCmd::PlaylistRemoveTrack(info) => {
+                if let Err(err) = player.playlist.write().remove_tracks(info) {
+                    error!("Error removing tracks: {err}");
+                }
+            }
+            PlayerCmd::PlaylistClear => {
+                player.reset_errors();
+                player.playlist.write().clear();
+            }
+            PlayerCmd::PlaylistSwapTrack(info) => {
+                if let Err(err) = player.playlist.write().swap_tracks(&info) {
+                    error!("Error swapping tracks: {err}");
+                }
+            }
+            PlayerCmd::PlaylistShuffle => {
+                player.playlist.write().shuffle();
+                player.run_info.write().take_enqueued();
+            }
+            PlayerCmd::PlaylistSort(criterion, direction) => {
+                player
+                    .playlist
+                    .write()
+                    .sort_by_mode(criterion, direction, &player.db);
+            }
+            PlayerCmd::PlaylistRemoveDeletedTracks => {
+                player.playlist.write().remove_deleted_items();
+            }
+            PlayerCmd::MetadataChanged => {
+                trace!("Metadata changed");
+                if let Some(track) = player.run_info.read().current_track() {
+                    let mut p_tick = playerstats.lock();
+                    update_metadata_changed(&mut p_tick, &player, track);
+                }
+                player.metadata_changed();
+            }
+        }
+
+        cb.call();
+    }
+
+    Ok(())
+}
+
+/// Update [`PlayerStats`] on metadata change or on tick.
+///
+/// Deduplicated
+#[allow(irrefutable_let_patterns)] // if only one backend is enabled, rust will complain that it is the only thing that happens
+fn update_metadata_changed(p_tick: &mut PlayerStats, player: &GeneralPlayer, track: &Track) {
+    if MediaTypesSimple::LiveRadio == track.media_type() {
+        // TODO: consider changing "radio_title" and "media_title" to be consistent
+        p_tick.radio_title = player.media_info().media_title.unwrap_or_default();
+
+        if let Backend::Rusty(backend) = &player.backend {
+            p_tick.progress.total_duration = Some(Duration::from_secs(
+                ((*backend.radio_downloaded.lock() as f32 * 44100.0 / 1000000.0 / 1024.0)
+                    * (backend.speed() as f32 / 10.0)) as u64,
+            ));
+        }
+
+        #[cfg(feature = "gst")]
+        if let Backend::GStreamer(_) = player.backend {
+            // p_tick.duration = player.backend.get_buffer_duration();
+            // error!("buffer duration: {}", p_tick.duration);
+            p_tick.progress.total_duration =
+                Some(p_tick.progress.position.unwrap_or_default() + Duration::from_secs(20));
+        }
+    }
+}
+
+/// Common [`PlayerCmd::Eos`] handler.
+///
+/// Use `use_skip` to skip the next track instead of trying to play it.
+fn player_eos(player: &mut GeneralPlayer, use_skip: bool) {
+    let playlist = player.playlist.read();
+    if playlist.is_empty() {
+        drop(playlist);
+        player.stop();
+        return;
+    }
+    if player.errors_since_last_progress >= BACKEND_ERROR_LIMIT.get() {
+        error!(
+            "Stopping playback because too many errors happened in succession; Limit: {}",
+            BACKEND_ERROR_LIMIT.get()
+        );
+        drop(playlist);
+        // this path should also call stop, but currently stop on a non-empty playlist basically resets playback on tick
+        player.stop();
+        return;
+    }
+    debug!(
+        "current track index: {:?}",
+        playlist.get_current_track_index()
+    );
+    drop(playlist);
+    // skip the next one as it had already errored via enqueuement, no need to try again
+    if use_skip {
+        player.next();
+    } else {
+        player.start_play(true);
+    }
+    debug!(
+        "playing index is: {}",
+        player.playlist.read().get_current_track_index()
+    );
+}
+
+/// Spawn the thread that periodically sends [`PlayerCmd::Tick`]
+fn ticker_thread(cmd_tx: PlayerCmdSender) -> Result<()> {
+    std::thread::Builder::new()
+        .name("ticker".into())
+        .spawn(move || {
+            while cmd_tx.send(PlayerCmd::Tick).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        })?;
+
+    Ok(())
+}
+
+fn get_config(args: &cli::Args) -> Result<ServerOverlay> {
+    let config = ServerConfigVersionedDefaulted::from_config_path()?.into_settings();
+
+    let max_depth = args.max_depth.map(ScanDepth::Limited);
+
+    let music_dir = if let Some(ref dir) = args.music_directory {
+        Some(get_path(dir).context("cli provided music-dir")?)
+    } else {
+        None
+    };
+
+    let overlay = ServerOverlay {
+        settings: config,
+        music_dir_overwrite: music_dir,
+        disable_discord_status: args.disable_discord,
+        metadata_scan_depth: max_depth,
+    };
+
+    Ok(overlay)
+}
+
+fn get_path(dir: &Path) -> Result<PathBuf> {
+    let mut path = dir.to_path_buf();
+
+    if path.exists() {
+        if !path.has_root()
+            && let Ok(p_base) = std::env::current_dir()
+        {
+            path = p_base.join(path);
+        }
+
+        if let Ok(p_canonical) = path.canonicalize() {
+            path = p_canonical;
+        }
+
+        return Ok(path);
+    }
+
+    bail!("Error: non-existing directory '{}'", dir.display());
+}
+
+async fn execute_action(action: cli::Action, config: &ServerOverlay) -> Result<()> {
+    match action {
+        cli::Action::Podcast(podcast_action) => match podcast_action {
+            cli::PodcastAction::Import { file } => {
+                println!("need to import from file {}", file.display());
+
+                let path = get_path(&file).context("import cli file-path")?;
+                let config_dir_path =
+                    utils::get_app_config_path().context("getting app-config-path")?;
+
+                podcast::import_from_opml(&config_dir_path, &config.settings.podcast, &path)
+                    .await
+                    .context("import opml")?;
+            }
+            cli::PodcastAction::Export { file } => {
+                println!("need to export to file {}", file.display());
+                let path = utils::absolute_path(&file)?;
+                let config_dir_path =
+                    utils::get_app_config_path().context("getting app-config-path")?;
+                podcast::export_to_opml(&config_dir_path, &path).context("export opml")?;
+            }
+            cli::PodcastAction::Refresh => {
+                let config_dir_path =
+                    utils::get_app_config_path().context("getting app-config-path")?;
+                podcast::refresh_all_feeds(&config_dir_path, &config.settings.podcast)
+                    .await
+                    .context("refresh feeds")?;
+            }
+        },
+    };
+
+    Ok(())
+}

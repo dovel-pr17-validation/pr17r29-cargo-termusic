@@ -1,0 +1,52 @@
+use termusiclib::player::playlist_helpers::{
+    PlaylistAddTrack, PlaylistPlaySpecific, PlaylistRemoveTrackIndexed, PlaylistSwapTrack,
+};
+use termusiclib::player::protobuf::queue::{SortCriterion, SortDirection};
+
+#[allow(clippy::doc_link_with_quotes)]
+/// Enum for Commands to send to the Services to send to the server.
+// This is completely different from playback's PlayerCmd, as the tui may need to handle stuff differently and not need all variants
+#[derive(Clone, Debug)]
+pub enum TuiCmd {
+    TogglePause,
+    // Play,
+    // Pause,
+    RestartTrack,
+    SeekForward,
+    SeekBackward,
+    VolumeUp,
+    VolumeDown,
+    SpeedUp,
+    SpeedDown,
+    SkipNext,
+    SkipPrevious,
+    ToggleGapless,
+    CycleLoop,
+
+    GetProgress,
+    ReloadConfig,
+
+    CheckVersion,
+    Playlist(PlaylistCmd),
+    QuitServer,
+}
+
+/// Enum for Commands to send specificly for Playlist
+#[derive(Clone, Debug)]
+pub enum PlaylistCmd {
+    PlaySpecific(PlaylistPlaySpecific),
+    AddTrack(PlaylistAddTrack),
+    RemoveTrack(PlaylistRemoveTrackIndexed),
+    Clear,
+    SwapTrack(PlaylistSwapTrack),
+    Shuffle,
+    Sort {
+        criterion: SortCriterion,
+        direction: SortDirection,
+    },
+    RemoveDeletedItems,
+
+    /// Re-Request the playlist tracks and state
+    #[allow(dead_code)] // replace with "expect" on 1.81 upgrade
+    SelfReloadPlaylist,
+}

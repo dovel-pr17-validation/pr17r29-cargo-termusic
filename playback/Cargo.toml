@@ -1,0 +1,82 @@
+[package]
+name = "termusic-playback"
+description = "playback library to support termusic."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+
+[lib]
+name = "termusicplayback"
+path = "src/lib.rs"
+doctest = false
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+termusic-lib.workspace = true
+alphanumeric-sort.workspace = true
+anyhow.workspace = true
+async-ringbuf.workspace = true
+base64.workspace = true
+discord-rich-presence.workspace = true
+glib = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true}
+libmpv-sirno = { workspace = true, optional = true }
+log.workspace = true
+parking_lot.workspace = true
+pathdiff.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+soundtouch = { workspace = true, optional = true }
+souvlaki.workspace = true
+stream-download.workspace = true
+symphonia.workspace = true
+symphonia-adapter-libopus = { workspace = true, optional = true }
+rodio.workspace = true
+tokio.workspace = true
+# soundtouch= { git = 'https://github.com/Drewol/soundtouch-rs.git' }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+	"Win32_Foundation",
+	"Win32_Graphics_Gdi",
+	"Win32_System_LibraryLoader",
+	"Win32_UI_WindowsAndMessaging"
+] }
+symphonia-adapter-libopus = { workspace = true, optional = true, features = ["bundled"]}
+
+[features]
+# NOTE: do NOT enable any backends here, enable them in crate "server"!
+# otherwise you will not be able to start that backend
+default = []
+# cover = []
+gst = ["dep:gstreamer", "dep:glib"]
+mpv = ["dep:libmpv-sirno"]
+rusty-soundtouch = ["dep:soundtouch"]
+rusty-libopus = ["dep:symphonia-adapter-libopus"]
+all-backends = ["gst", "mpv"]
+
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+criterion.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
+indoc.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "async_ring"
+harness = false
