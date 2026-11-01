@@ -27,7 +27,7 @@ termusic-lib = { path = "lib/", version = "0.13.2" }
 termusic-playback = { path = "playback/", version = "0.13.2", default-features = false }
 
 # --- Common Dependencies (used across multiple crates / termusic-lib) ---
-anyhow = { version = "1.0.102", features = ["backtrace"] }
+anyhow = { version = "1.0.104", features = ["backtrace"] }
 log = "0.4.32"
 flexi_logger = "0.31.9"
 ahash = "^0.8.12"
@@ -143,7 +143,7 @@ textwrap = "0.16.2"
 # ratatui is very specific with its versions
 unicode-width = "^0.2.2"
 wildmatch = "2.6"
-alphanumeric-sort = "1.5.7"
+alphanumeric-sort = "1.5.8"
 
 # --- Dev Dependencies ---
 criterion = "0.8"

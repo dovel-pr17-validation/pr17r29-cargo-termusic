@@ -71,9 +71,9 @@ checksum = "5c6cb57a04249c6480766f7f7cef5467412af1490f8d1e243141daddada3264f"
 
 [[package]]
 name = "alphanumeric-sort"
-version = "1.5.7"
+version = "1.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44ed2d38c0ddba387b4e25a9314fbce6a805f9988e66896e454fed1f8432e4e5"
+checksum = "a97de3ad85c4425a2c267a5e91adbe49f9f14e650bd9c78e96b6bc00e5f6673a"
 
 [[package]]
 name = "alsa"
@@ -173,9 +173,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arbitrary"
